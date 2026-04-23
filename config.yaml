@@ -1,0 +1,29 @@
+# config.yaml
+
+dataset:
+  name: "msmarco_passage"
+  topics_variant: "dev.small"                 # o "test", a seconda del dataset
+  qrels_variant: "dev.small"
+  
+
+# Parametri Generali dell'Esperimento
+experiment:
+  scorer: "all"       # Opzioni: qualt5, tasb, perplexity, itn, cdd, all
+  threshold: 0.60         # Valore di pruning (es. 0.1 = 10%)
+  restart_cache: false   # Se true, ignora i checkpoint e ricalcola tutto
+  retriever: "all"    # Opzioni: "bm25", "splade", "tasb", o "all"
+
+# Percorsi di Output
+paths:
+  cache_dir: "./cache"
+  indexes_dir: "./indexes"
+  results_dir: "./results2"
+  runs_dir: "./runs"  # Directory per i run dei sistemi (es. TREC)
+  full_runs_dir: "./runs/runs_full_msmarco_all"
+
+# Parametri Avanzati (Opzionali, per tweaking)
+advanced:
+  chunk_size: 100000
+  batch_size: 32
+
+

@@ -1,0 +1,15 @@
+lmppl
+nltk
+numpy
+pandas
+pyterrier==1.0.4
+pyterrier_dr==0.7.0
+pyterrier_pisa==0.3.1
+scipy
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch
+transformers==4.46.0
+faiss-gpu
+PyYAML
+git+https://github.com/terrierteam/pyterrier-quality.git
+
