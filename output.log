@@ -1,0 +1,80 @@
+nohup: ignoring input
+Java started and loaded: pyterrier.java.colab, pyterrier.java, pyterrier.java.24, pyterrier.terrier.java [version=5.11 (build: craig.macdonald 2025-01-13 21:29), helper_version=0.0.8]
+/home/sacco/metaqual/data/loaders/msmarco/dataset_loader.py:26: DeprecationWarning: Call to deprecated method pt.init(). Deprecated since version 0.11.0.
+java is now started automatically with default settings. To force initialisation early, run:
+pt.java.init() # optional, forces java initialisation
+  pt.init()
+2026-04-23 15:15:34,673 | INFO | data.loaders.msmarco.dataset_loader | Loaded split 'train': unique_ids=516472 cumulative_union=516472
+2026-04-23 15:15:34,723 | INFO | data.loaders.msmarco.dataset_loader | Loaded split 'dev': unique_ids=59096 cumulative_union=573281
+2026-04-23 15:15:34,732 | INFO | data.loaders.msmarco.dataset_loader | Loaded split 'dev.small': unique_ids=7433 cumulative_union=573281
+2026-04-23 15:15:34,737 | INFO | data.loaders.msmarco.dataset_loader | Loaded split 'test-2019': unique_ids=9139 cumulative_union=581647
+2026-04-23 15:15:34,743 | INFO | data.loaders.msmarco.dataset_loader | Loaded split 'test-2020': unique_ids=11224 cumulative_union=591854
+2026-04-23 15:15:34,743 | INFO | data.loaders.msmarco.dataset_loader | Building targeted collection at data/msmarco_passage/msmarco_passage_with_target.tsv
+2026-04-23 15:15:34,743 | INFO | data.loaders.msmarco.dataset_loader | Qrels union size: 591854
+2026-04-23 15:15:36,371 | INFO | data.loaders.msmarco.dataset_loader | Processed 500000 passages...
+2026-04-23 15:15:37,966 | INFO | data.loaders.msmarco.dataset_loader | Processed 1000000 passages...
+2026-04-23 15:15:39,552 | INFO | data.loaders.msmarco.dataset_loader | Processed 1500000 passages...
+2026-04-23 15:15:41,158 | INFO | data.loaders.msmarco.dataset_loader | Processed 2000000 passages...
+2026-04-23 15:15:42,737 | INFO | data.loaders.msmarco.dataset_loader | Processed 2500000 passages...
+2026-04-23 15:15:44,332 | INFO | data.loaders.msmarco.dataset_loader | Processed 3000000 passages...
+2026-04-23 15:15:45,932 | INFO | data.loaders.msmarco.dataset_loader | Processed 3500000 passages...
+2026-04-23 15:15:47,605 | INFO | data.loaders.msmarco.dataset_loader | Processed 4000000 passages...
+2026-04-23 15:15:49,256 | INFO | data.loaders.msmarco.dataset_loader | Processed 4500000 passages...
+2026-04-23 15:15:50,840 | INFO | data.loaders.msmarco.dataset_loader | Processed 5000000 passages...
+2026-04-23 15:15:52,440 | INFO | data.loaders.msmarco.dataset_loader | Processed 5500000 passages...
+2026-04-23 15:15:54,048 | INFO | data.loaders.msmarco.dataset_loader | Processed 6000000 passages...
+2026-04-23 15:15:55,782 | INFO | data.loaders.msmarco.dataset_loader | Processed 6500000 passages...
+2026-04-23 15:15:57,375 | INFO | data.loaders.msmarco.dataset_loader | Processed 7000000 passages...
+2026-04-23 15:15:58,916 | INFO | data.loaders.msmarco.dataset_loader | Processed 7500000 passages...
+2026-04-23 15:16:00,493 | INFO | data.loaders.msmarco.dataset_loader | Processed 8000000 passages...
+2026-04-23 15:16:02,032 | INFO | data.loaders.msmarco.dataset_loader | Processed 8500000 passages...
+2026-04-23 15:16:03,086 | INFO | data.loaders.msmarco.dataset_loader | Targeted collection completed. total=8841823 target_1=591854 target_0=8249969
+2026-04-23 15:16:23,962 | INFO | data.loaders.msmarco.dataset_loader | Validation successful for data/msmarco_passage/msmarco_passage_with_target.tsv
+Inizializzazione loader per il dataset 'msmarco_passage'...
+
+[BUILD RESULT]
+{
+  "built": true,
+  "output_path": "data/msmarco_passage/msmarco_passage_with_target.tsv",
+  "splits": [
+    "train",
+    "dev",
+    "dev.small",
+    "test-2019",
+    "test-2020"
+  ],
+  "qrels_union_size": 591854,
+  "qrels_split_unique_counts": {
+    "train": 516472,
+    "dev": 59096,
+    "dev.small": 7433,
+    "test-2019": 9139,
+    "test-2020": 11224
+  },
+  "stats": {
+    "total_passages": 8841823,
+    "target_1": 591854,
+    "target_0": 8249969,
+    "target_1_pct": 6.693801,
+    "target_0_pct": 93.306199
+  }
+}
+
+[VALIDATION RESULT]
+{
+  "valid": true,
+  "path": "data/msmarco_passage/msmarco_passage_with_target.tsv",
+  "rows": 8841823,
+  "corpus_rows": 8841823,
+  "observed_target_values": [
+    0,
+    1
+  ],
+  "stats": {
+    "total_passages": 8841823,
+    "target_1": 591854,
+    "target_0": 8249969,
+    "target_1_pct": 6.693801,
+    "target_0_pct": 93.306199
+  }
+}

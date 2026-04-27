@@ -8,7 +8,7 @@ import pyterrier_dr
 import pyt_splade
 
 from pyterrier_quality import QualCache, Filter
-from metaqual.data.loaders.dataset_loader import DatasetLoader
+from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 from pyterrier_pisa import PisaStemmer
 
 

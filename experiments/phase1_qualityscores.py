@@ -7,7 +7,7 @@ from itertools import islice
 import yaml
 
 from metaqual.models.base_scorer import get_scorer
-from metaqual.data.loaders.dataset_loader import DatasetLoader
+from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 
 def checkpointed_iter(corpus_iter, scorer_name, chunk_size=50000, checkpoint_dir="./cache"):
     """

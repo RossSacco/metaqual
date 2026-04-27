@@ -13,7 +13,7 @@ import pyt_splade
 import ir_measures
 import pandas as pd
 
-from metaqual.data.loaders.dataset_loader import DatasetLoader
+from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 from metaqual.retrieval.pyterrier_pipe import RetrievalPipelines
 
 

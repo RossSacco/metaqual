@@ -13,7 +13,7 @@ import pyt_splade
 import ir_measures
 import pandas as pd
 
-from metaqual.data.loaders.dataset_loader import DatasetLoader
+from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 from metaqual.retrieval.pyterrier_pipe import RetrievalPipelines
 
 
@@ -229,7 +229,7 @@ def build_full_systems(config: Dict[str, Any]) -> Tuple[List[Any], List[str]]:
         tasb_model = move_model_to_cuda(tasb_model, "TAS-B Full")
 
         print("[DEBUG] Caricamento FlexIndex per TAS-B FULL da HuggingFace...")
-        full_tasb_index = pyterrier_dr.FlexIndex.from_hf("macavaney/msmarco-passage.tasb.flex")
+        full_tasb_index = pyterrier_dr.FlexIndex.from_hf("q")
 
         tasb_encoder_gpu = tasb_model.query_encoder(batch_size=64, verbose=True)
         pipe_tasb_full = tasb_encoder_gpu >> full_tasb_index

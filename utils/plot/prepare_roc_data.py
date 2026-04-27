@@ -2,7 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 import pickle
-from metaqual.data.loaders.dataset_loader import DatasetLoader
+from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 from pyterrier_quality import QualCache
 
 def prepare_data(cache_dir="./cache", output_file="roc_data.pkl"):
