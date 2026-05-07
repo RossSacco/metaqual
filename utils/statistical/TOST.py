@@ -23,12 +23,16 @@ def paired_ci(diffs, alpha=0.05):
 
 def run_pruning_tost(path, alpha=0.05, rel_lower_bound=0.05, upper_bound=1e6):
     df = pd.read_csv(path)
-    m = re.search(r"compare_all_(.+?)_(\d+(?:\.\d+)?)_perquery_wide\.csv", os.path.basename(path))
+    m = re.search(
+        r"compare_all_(?P<scorer>[^_]+)_(?:(?P<qrels_variant>.+)_)?(?P<threshold>\d+(?:\.\d+)?)_perquery_wide\.csv",
+        os.path.basename(path)
+    )
     if not m:
         raise ValueError(f"Filename non riconosciuto: {path}")
 
-    scorer = m.group(1)
-    threshold = float(m.group(2))
+    scorer = m.group("scorer")
+    qrels_variant = m.group("qrels_variant")
+    threshold = float(m.group("threshold"))
 
     systems = ["BM25", "SPLADE", "TAS-B"]
     metrics = ["RR@10", "nDCG@10", "R@100"]
@@ -67,6 +71,7 @@ def run_pruning_tost(path, alpha=0.05, rel_lower_bound=0.05, upper_bound=1e6):
 
             rows.append({
                 "scorer": scorer,
+                "qrels_variant": qrels_variant,
                 "threshold": threshold,
                 "pruning_percent": threshold * 100.0,
                 "pipeline": system,

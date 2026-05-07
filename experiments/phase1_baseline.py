@@ -17,7 +17,8 @@ from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 from metaqual.retrieval.pyterrier_pipe import RetrievalPipelines
 
 
-SUPPORTED_SCORERS = ["qualt5", "tasb", "perplexity", "itn", "cdd"]
+DEFAULT_SCORERS = ["qualt5", "tasb", "perplexity", "itn", "cdd"]
+SUPPORTED_SCORERS = DEFAULT_SCORERS + ["finetuned_qualt5"]
 
 
 # =========================================================
@@ -241,6 +242,7 @@ def save_pairwise_perquery_outputs(
     scorer_name: str,
     threshold: Any,
     active_retriever: str,
+    qrels_variant: str,
     results_dir: str,
 ) -> None:
     """
@@ -250,7 +252,7 @@ def save_pairwise_perquery_outputs(
     3. CSV per-query pivotato: una riga per qid, colonne separate per sistema e metrica
     4. CSV differenze Full - Pruned per query, utile per test statistici
     """
-    prefix = f"{active_retriever}_{scorer_name}_{threshold}"
+    prefix = f"{active_retriever}_{scorer_name}_{qrels_variant}_{threshold}"
 
     avg_path = os.path.join(results_dir, f"compare_{prefix}.csv")
     perq_long_path = os.path.join(results_dir, f"compare_{prefix}_perquery_long.csv")
@@ -363,6 +365,7 @@ def run_single_scorer_evaluation(
 ) -> None:
     threshold = config["experiment"]["threshold"]
     active_retriever = config["experiment"].get("retriever", "all").lower()
+    qrels_variant = config["dataset"]["qrels_variant"]
 
     indexes_dir = config["paths"]["indexes_dir"]
     results_dir = config["paths"]["results_dir"]
@@ -371,7 +374,10 @@ def run_single_scorer_evaluation(
     ensure_path_exists(indexes_dir, "Cartella indexes_dir")
     os.makedirs(results_dir, exist_ok=True)
 
-    runs_dir = os.path.join(base_runs_dir, f"runs_{active_retriever}_{scorer_name}_{threshold}")
+    runs_dir = os.path.join(
+        base_runs_dir,
+        f"runs_{active_retriever}_{scorer_name}_{qrels_variant}_{threshold}"
+    )
     os.makedirs(runs_dir, exist_ok=True)
 
     print(f"[DEBUG] Configurazione:")
@@ -409,6 +415,7 @@ def run_single_scorer_evaluation(
         scorer_name=scorer_name,
         threshold=threshold,
         active_retriever=active_retriever,
+        qrels_variant=qrels_variant,
         results_dir=results_dir,
     )
 
@@ -427,7 +434,7 @@ def run_evaluation(config: Dict[str, Any]) -> None:
     scorer_name = config["experiment"]["scorer"]
 
     if scorer_name == "all":
-        for scorer in SUPPORTED_SCORERS:
+        for scorer in DEFAULT_SCORERS:
             print("\n" + "=" * 80)
             print(f"[INFO] Avvio esperimento per scorer: {scorer}")
             print("=" * 80 + "\n")

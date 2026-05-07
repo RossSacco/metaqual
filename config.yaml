@@ -8,22 +8,30 @@ dataset:
 
 # Parametri Generali dell'Esperimento
 experiment:
-  scorer: "all"       # Opzioni: qualt5, tasb, perplexity, itn, cdd, all
+  scorer: "all"       # Opzioni: qualt5, finetuned_qualt5, tasb, perplexity, itn, cdd, all
   threshold: 0.60         # Valore di pruning (es. 0.1 = 10%)
   restart_cache: false   # Se true, ignora i checkpoint e ricalcola tutto
   retriever: "all"    # Opzioni: "bm25", "splade", "tasb", o "all"
 
 # Percorsi di Output
 paths:
-  cache_dir: "./cache"
-  indexes_dir: "./indexes"
+  cache_dir: "/data/data-sacco/cache"
+  indexes_dir: "/data/data-sacco/indexes"
   results_dir: "./results2"
-  runs_dir: "./runs"  # Directory per i run dei sistemi (es. TREC)
-  full_runs_dir: "./runs/runs_full_msmarco_all"
+  runs_dir: "/data/data-sacco/runs"  # Naming pruned: runs_{retriever}_{scorer}_{qrels_variant}_{threshold}
+                                    # es. runs_all_cdd_dev.small_0.15
+  full_runs_dir: "/data/data-sacco/runs/runs_full_msmarco_all"
+
+# Config opzionale per scorer specifici
+scorers:
+  finetuned_qualt5:
+    model_name_or_path: "/path/to/qualt5-finetuned"
+    batch_size: 64
+    max_length: 256
+    device: "cuda"
+    scoring_mode: "true_prob"  # true_prob | logit_diff
 
 # Parametri Avanzati (Opzionali, per tweaking)
 advanced:
   chunk_size: 100000
   batch_size: 32
-
-

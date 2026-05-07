@@ -9,6 +9,10 @@ import yaml
 from metaqual.models.base_scorer import get_scorer
 from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 
+DEFAULT_SCORERS = ['qualt5', 'tasb', 'perplexity', 'itn', 'cdd']
+SUPPORTED_SCORERS = DEFAULT_SCORERS + ['finetuned_qualt5']
+
+
 def checkpointed_iter(corpus_iter, scorer_name, chunk_size=50000, checkpoint_dir="./cache"):
     """
     Wraps the corpus iterator. Saves progress to a text file
@@ -42,7 +46,7 @@ def checkpointed_iter(corpus_iter, scorer_name, chunk_size=50000, checkpoint_dir
     with open(ckpt_file, 'w') as f:
         f.write(str(processed_docs + count))
 
-def cache_gen(name_scorer, dataset_name, path_output_base="./cache", resume=True):
+def cache_gen(name_scorer, dataset_name, path_output_base="./cache", resume=True, scorer_kwargs=None):
     if not pt.started():
         pt.init()
 
@@ -54,7 +58,7 @@ def cache_gen(name_scorer, dataset_name, path_output_base="./cache", resume=True
     print("DEBUG: DatasetLoader pronto. Recupero iteratore...") # Aggiungi questo
     corpus_iter = loader.get_corpus_iter()
     
-    kwargs = {}
+    kwargs = dict(scorer_kwargs or {})
     if name_scorer == 'cdd':
         kwargs['background_corpus'] = loader.get_corpus_iter()
 
@@ -101,13 +105,23 @@ if __name__ == "__main__":
     restart = config['experiment']['restart_cache']
     cache_dir = config['paths']['cache_dir']
     dataset_name = config['dataset']['name']
+    scorers_cfg = config.get("scorers", {})
     
-    ALL_SCORER = ['qualt5', 'tasb', 'perplexity', 'itn', 'cdd']
     resume_flag = not restart
-    scorers_da_eseguire = ALL_SCORER if scorer_scelto == 'all' else [scorer_scelto]
+    scorers_da_eseguire = DEFAULT_SCORERS if scorer_scelto == 'all' else [scorer_scelto]
+
+    for s in scorers_da_eseguire:
+        if s not in SUPPORTED_SCORERS:
+            raise ValueError(f"Scorer non supportato: {s}. Valori ammessi: {SUPPORTED_SCORERS + ['all']}")
     
     for s in scorers_da_eseguire:
-        cache_gen(s, dataset_name=dataset_name, path_output_base=cache_dir, resume=resume_flag)
+        cache_gen(
+            s,
+            dataset_name=dataset_name,
+            path_output_base=cache_dir,
+            resume=resume_flag,
+            scorer_kwargs=scorers_cfg.get(s, {})
+        )
         
         
         

@@ -19,12 +19,16 @@ if __name__ == "__main__":
     rows = []
     for f in summary_files:
         name = os.path.basename(f)
-        m = re.match(r"compare_all_(.+?)_(\d+(?:\.\d+)?)\.csv$", name)
+        m = re.match(
+            r"compare_all_(?P<scorer>[^_]+)_(?:(?P<qrels_variant>.+)_)?(?P<threshold>\d+(?:\.\d+)?)\.csv$",
+            name
+        )
         if not m:
             continue
 
-        scorer = m.group(1)
-        threshold = float(m.group(2))
+        scorer = m.group("scorer")
+        qrels_variant = m.group("qrels_variant")
+        threshold = float(m.group("threshold"))
 
         df = pd.read_csv(f)
         metric_cols = df.columns.tolist()
@@ -38,6 +42,7 @@ if __name__ == "__main__":
 
             rows.append({
                 "scorer": scorer,
+                "qrels_variant": qrels_variant,
                 "threshold": threshold,
                 "pruning_percent": threshold * 100.0,
                 "pipeline": pipeline,

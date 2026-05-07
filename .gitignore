@@ -40,4 +40,4 @@ Thumbs.db
 *.local
 
 data/msmarco_passage/
-models/outputs/
+models/outputs

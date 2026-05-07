@@ -7,7 +7,7 @@ from collections import Counter
 import re
 import lmppl
 from nltk.stem import PorterStemmer
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import pyterrier_dr
 import numpy as np
 from pyterrier_quality import QualT5, Filter
@@ -191,6 +191,150 @@ class CDDScorer(pt.Transformer):
             
         res['quality'] = scores
         return res
+
+
+class FinetunedQualT5Scorer(pt.Transformer):
+    """
+    Supervised QT5 passage quality scorer (query-independent) trained from
+    MSMARCO triples where query is intentionally ignored and:
+      - p+ -> "true"
+      - p- -> "false"
+
+    Prompt format:
+      Document: {passage} Relevant:
+
+    Final scoring, aligned with pyterrier-quality QualT5:
+      quality = log P(true | true,false)
+
+    This is computed as:
+      log_softmax([logit_true, logit_false])[0]
+    """
+
+    def __init__(
+        self,
+        model_name_or_path,
+        batch_size=64,
+        max_length=256,
+        device=None,
+    ):
+        if not model_name_or_path:
+            raise ValueError(
+                "Per 'finetuned_qualt5' devi specificare 'model_name_or_path' "
+                "nei kwargs o in config scorers.finetuned_qualt5."
+            )
+
+        self.model_name_or_path = model_name_or_path
+        self.batch_size = int(batch_size)
+        self.max_length = int(max_length)
+        self.device = self._resolve_device(device)
+
+        print(
+            f"Inizializzazione FinetunedQualT5Scorer "
+            f"(model={self.model_name_or_path}, device={self.device}, "
+            f"batch_size={self.batch_size}, max_length={self.max_length})..."
+        )
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name_or_path)
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.true_token_id = self.tokenizer.encode(
+            "true", add_special_tokens=False
+        )[0]
+        self.false_token_id = self.tokenizer.encode(
+            "false", add_special_tokens=False
+        )[0]
+
+        if self.true_token_id is None or self.false_token_id is None:
+            raise RuntimeError(
+                "Tokenizzazione di 'true'/'false' non valida per questo tokenizer."
+            )
+
+    def _resolve_device(self, requested_device):
+        if requested_device:
+            if str(requested_device).startswith("cuda") and not torch.cuda.is_available():
+                print("[WARNING] CUDA richiesta ma non disponibile. Fallback su CPU.")
+                return torch.device("cpu")
+            return torch.device(requested_device)
+
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _build_prompt(self, passage_text):
+        return f"Document: {passage_text} Relevant:"
+
+    def _score_batch(self, batch_texts):
+        prompts = [self._build_prompt(t) for t in batch_texts]
+
+        encoded = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+
+        input_ids = encoded["input_ids"].to(self.device)
+        attention_mask = encoded["attention_mask"].to(self.device)
+
+        batch_size = input_ids.size(0)
+
+        decoder_start_token_id = self.model.config.decoder_start_token_id
+        if decoder_start_token_id is None:
+            decoder_start_token_id = self.tokenizer.pad_token_id
+
+        decoder_input_ids = torch.full(
+            (batch_size, 1),
+            decoder_start_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                decoder_input_ids=decoder_input_ids,
+            )
+
+            # Prima posizione del decoder: predizione del token dopo "Relevant:"
+            first_logits = outputs.logits[:, 0, :]
+
+            true_logits = first_logits[:, self.true_token_id]
+            false_logits = first_logits[:, self.false_token_id]
+
+            true_false_logits = torch.stack(
+                [true_logits, false_logits],
+                dim=1,
+            )
+
+            # Score finale coerente a pyterrier-quality:
+            # log P(true | true,false)
+            quality_scores = torch.log_softmax(
+                true_false_logits,
+                dim=1,
+            )[:, 0]
+
+        return quality_scores.detach().cpu().tolist()
+
+    def transform(self, df):
+        res = df.copy()
+
+        if "text" not in res.columns:
+            raise ValueError(
+                "FinetunedQualT5Scorer richiede una colonna 'text'."
+            )
+
+        texts = res["text"].astype(str).tolist()
+        quality_scores = []
+
+        for start_idx in range(0, len(texts), self.batch_size):
+            batch_texts = texts[start_idx:start_idx + self.batch_size]
+            scores = self._score_batch(batch_texts)
+            quality_scores.extend(float(s) for s in scores)
+
+        res["quality"] = quality_scores
+        return res
     
     
 def get_scorer(nome_scorer, **kwargs):
@@ -198,7 +342,7 @@ def get_scorer(nome_scorer, **kwargs):
     Initializes and returns the requested scorer ready for the PyTerrier pipeline.
     
     Arguments:
-    - nome_scorer: string ('qualt5', 'tasb', 'perplexity', 'itn', 'cdd')
+    - nome_scorer: string ('qualt5', 'finetuned_qualt5', 'tasb', 'perplexity', 'itn', 'cdd')
     - kwargs: extra arguments (e.g., background_corpus for CDD)
     """
     nome_scorer = nome_scorer.lower()
@@ -208,6 +352,15 @@ def get_scorer(nome_scorer, **kwargs):
         model_size = kwargs.get('model_size', 'qt5-small')
         print(f"Inizializzazione QualT5 ({model_size})...")
         return QualT5(f'pyterrier-quality/{model_size}')
+
+    elif nome_scorer == 'finetuned_qualt5':
+        return FinetunedQualT5Scorer(
+            model_name_or_path=kwargs.get("model_name_or_path"),
+            batch_size=kwargs.get("batch_size", 64),
+            max_length=kwargs.get("max_length", 256),
+            device=kwargs.get("device"),
+            scoring_mode=kwargs.get("scoring_mode", "true_prob"),
+        )
         
     elif nome_scorer == 'tasb':
         print("Inizializzazione TAS-B Magnitude Scorer...")

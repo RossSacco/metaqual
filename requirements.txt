@@ -11,5 +11,5 @@ torch
 transformers==4.46.0
 faiss-gpu
 PyYAML
+ir_datasets
 git+https://github.com/terrierteam/pyterrier-quality.git
-
