@@ -359,7 +359,6 @@ def get_scorer(nome_scorer, **kwargs):
             batch_size=kwargs.get("batch_size", 64),
             max_length=kwargs.get("max_length", 256),
             device=kwargs.get("device"),
-            scoring_mode=kwargs.get("scoring_mode", "true_prob"),
         )
         
     elif nome_scorer == 'tasb':

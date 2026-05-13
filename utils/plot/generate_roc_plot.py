@@ -15,12 +15,12 @@ def plot_roc(input_file="roc_data.pkl"):
     axins = ax.inset_axes([0.05, 0.7, 0.25, 0.25])
     
     # Colori simili al grafico originale
-    colors = {'qualt5': '#1f77b4', 'itn': '#d62728', 'cdd': '#d62728', 
+    colors = {'finetuned_qualt5': '#1f77b4', 'itn': '#d62728', 'cdd': '#d62728', 
               'perplexity': '#e377c2', 'tasb': '#2ca02c'}
 
     # --- NUOVO: Dizionario per i nomi personalizzati nella legenda ---
     legend_names = {
-        'qualt5': 'QualT5-Small',
+        'finetuned_qualt5': 'QualT5-Finetuned',
         'perplexity': 'T5-Ppl',
         'tasb': 'TASB-Mag'
     }

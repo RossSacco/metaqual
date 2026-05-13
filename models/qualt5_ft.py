@@ -429,6 +429,7 @@ def main() -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         optim="adamw_torch",
+        weight_decay=0.01,
         max_grad_norm=1.0,
         save_strategy="steps",
         save_steps=args.save_steps,

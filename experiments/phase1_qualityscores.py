@@ -13,12 +13,12 @@ DEFAULT_SCORERS = ['qualt5', 'tasb', 'perplexity', 'itn', 'cdd']
 SUPPORTED_SCORERS = DEFAULT_SCORERS + ['finetuned_qualt5']
 
 
-def checkpointed_iter(corpus_iter, scorer_name, chunk_size=50000, checkpoint_dir="./cache"):
+def checkpointed_iter(corpus_iter,dataset_name ,scorer_name, chunk_size=50000, checkpoint_dir="./cache"):
     """
     Wraps the corpus iterator. Saves progress to a text file
     and skips already processed documents on restart.
     """
-    ckpt_file = os.path.join(checkpoint_dir, f"{scorer_name}_checkpoint.txt")
+    ckpt_file = os.path.join(checkpoint_dir, f"{scorer_name}_{dataset_name}_checkpoint.txt")
     processed_docs = 0
     
     # 1. Restore from checkpoint
@@ -83,7 +83,7 @@ def cache_gen(name_scorer, dataset_name, path_output_base="./cache", resume=True
     mia_cache = QualCache(percorso_cache)
 
     # Create checkpoint-protected iterator (saves every 100k docs)
-    safe_iter = checkpointed_iter(corpus_iter, name_scorer, chunk_size=100000, checkpoint_dir=path_output_base)
+    safe_iter = checkpointed_iter(corpus_iter, dataset_name, name_scorer, chunk_size=100000, checkpoint_dir=path_output_base)
 
     # Caching pipeline
     pipeline = scorer_transformer >> mia_cache.indexer()

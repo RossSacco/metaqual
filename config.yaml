@@ -8,8 +8,8 @@ dataset:
 
 # Parametri Generali dell'Esperimento
 experiment:
-  scorer: "all"       # Opzioni: qualt5, finetuned_qualt5, tasb, perplexity, itn, cdd, all
-  threshold: 0.60         # Valore di pruning (es. 0.1 = 10%)
+  scorer: "finetuned_qualt5"       # Opzioni: qualt5, finetuned_qualt5, tasb, perplexity, itn, cdd, all
+  threshold: 0.30         # Valore di pruning (es. 0.1 = 10%)
   restart_cache: false   # Se true, ignora i checkpoint e ricalcola tutto
   retriever: "all"    # Opzioni: "bm25", "splade", "tasb", o "all"
 
@@ -25,11 +25,11 @@ paths:
 # Config opzionale per scorer specifici
 scorers:
   finetuned_qualt5:
-    model_name_or_path: "/path/to/qualt5-finetuned"
-    batch_size: 64
+    model_name_or_path: "/home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000"
+    batch_size: 32
     max_length: 256
     device: "cuda"
-    scoring_mode: "true_prob"  # true_prob | logit_diff
+    
 
 # Parametri Avanzati (Opzionali, per tweaking)
 advanced:
