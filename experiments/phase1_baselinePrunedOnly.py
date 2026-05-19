@@ -17,13 +17,23 @@ from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 from metaqual.retrieval.pyterrier_pipe import RetrievalPipelines
 
 
-DEFAULT_SCORERS = ["qualt5", "tasb", "perplexity", "itn", "cdd"]
-SUPPORTED_SCORERS = DEFAULT_SCORERS + ["finetuned_qualt5"]
+DEFAULT_SCORERS = ["tasb", "perplexity", "itn", "cdd", "finetuned_qualt5"]
+SUPPORTED_SCORERS = DEFAULT_SCORERS
 
 
 # =========================================================
 # UTILS
 # =========================================================
+
+def get_qrels_name(config: Dict[str, Any]) -> str:
+    """
+    Se qrels_variant è una lista (es. per DL 19+20), la unisce con un underscore.
+    Altrimenti la converte semplicemente in stringa.
+    """
+    variant = config["dataset"]["qrels_variant"]
+    if isinstance(variant, list):
+        return "_".join(variant)
+    return str(variant)
 
 def ensure_pyterrier_started() -> None:
     print("[DEBUG] Inizializzazione di PyTerrier/Java...")
@@ -152,12 +162,12 @@ def get_full_runs_dir(config: Dict[str, Any]) -> str:
 def get_pruned_runs_dir(config: Dict[str, Any], scorer_name: str) -> str:
     active_retriever = config["experiment"].get("retriever", "all").lower()
     threshold = config["experiment"]["threshold"]
-    qrels_variant = config["dataset"]["qrels_variant"]
+    qrels_name = get_qrels_name(config) # <--- Modifica qui
     base_runs_dir = get_base_runs_dir(config)
 
     # Include il nome dei qrels per evitare collisioni tra run fatte con set di qrels diversi.
     pruned_runs_dir = os.path.join(
-        base_runs_dir, f"runs_{active_retriever}_{scorer_name}_{qrels_variant}_{threshold}"
+        base_runs_dir, f"runs_{active_retriever}_{scorer_name}_{qrels_name}_{threshold}"
     )
     os.makedirs(pruned_runs_dir, exist_ok=True)
     return pruned_runs_dir
@@ -169,17 +179,49 @@ def get_pruned_runs_dir(config: Dict[str, Any], scorer_name: str) -> str:
 
 def prepare_topics_and_qrels(config: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     dataset_name = config["dataset"]["name"]
-    topics_variant = config["dataset"]["topics_variant"]
-    qrels_variant = config["dataset"]["qrels_variant"]
+    topics_variants = config["dataset"]["topics_variant"]
+    qrels_variants = config["dataset"]["qrels_variant"]
 
-    print("\n[DEBUG] Caricamento dataset e pulizia query...")
+    # Rende il codice retrocompatibile se nel config passi una stringa singola
+    if isinstance(topics_variants, str):
+        topics_variants = [topics_variants]
+    if isinstance(qrels_variants, str):
+        qrels_variants = [qrels_variants]
+
+    print(f"\n[DEBUG] Caricamento dataset ({dataset_name}) per varianti: {topics_variants}...")
     loader = DatasetLoader(dataset_name)
-    topics = loader.get_topics(topics_variant).copy()
-    qrels = loader.get_qrels(qrels_variant)
 
+    topics_list = []
+    qrels_list = []
+
+    # Carica e accumula i topics
+    for tv in topics_variants:
+        topics_list.append(loader.get_topics(tv).copy())
+        
+    # Carica e accumula le qrels
+    for qv in qrels_variants:
+        qrels_list.append(loader.get_qrels(qv).copy())
+
+    # Concatena le liste di DataFrame in un unico DataFrame
+    topics = pd.concat(topics_list, ignore_index=True)
+    qrels = pd.concat(qrels_list, ignore_index=True)
+
+    # Rimuovi eventuali duplicati di sicurezza
+    topics = topics.drop_duplicates(subset=["qid"])
+    
+    # Assicurati che non ci siano duplicati sulla coppia query-documento nelle qrels
+    if "docno" in qrels.columns:
+        qrels = qrels.drop_duplicates(subset=["qid", "docno"])
+
+    # Applica il filtro: mantieni solo le query che hanno giudizi nelle qrels
     topics = topics[topics["qid"].isin(qrels["qid"])].copy()
     topics["query"] = topics["query"].apply(clean_query_for_terrier)
+    
+    # Rimuovi eventuali query rimaste vuote dopo la pulizia
     topics = topics[topics["query"].astype(str).str.len() > 0].copy()
+
+    print(f"[DEBUG] Totale query unificate: {len(topics)}")
+    print(f"[DEBUG] Totale qrels unificate: {len(qrels)}")
 
     return topics, qrels
 
@@ -233,7 +275,7 @@ def build_full_systems(config: Dict[str, Any]) -> Tuple[List[Any], List[str]]:
         tasb_model = move_model_to_cuda(tasb_model, "TAS-B Full")
 
         print("[DEBUG] Caricamento FlexIndex per TAS-B FULL da HuggingFace...")
-        full_tasb_index = pyterrier_dr.FlexIndex.from_hf("q")
+        full_tasb_index = pyterrier_dr.FlexIndex.from_hf("macavaney/msmarco-passage.tasb.flex")
 
         tasb_encoder_gpu = tasb_model.query_encoder(batch_size=64, verbose=True)
         pipe_tasb_full = tasb_encoder_gpu >> full_tasb_index
@@ -506,7 +548,7 @@ def run_single_scorer_evaluation(
 ) -> None:
     threshold = config["experiment"]["threshold"]
     active_retriever = config["experiment"].get("retriever", "all").lower()
-    qrels_variant = config["dataset"]["qrels_variant"]
+    qrels_name = get_qrels_name(config)  # <--- Modifica qui
 
     indexes_dir = config["paths"]["indexes_dir"]
     results_dir = config["paths"]["results_dir"]
@@ -542,7 +584,7 @@ def run_single_scorer_evaluation(
         scorer_name=scorer_name,
         threshold=threshold,
         active_retriever=active_retriever,
-        qrels_variant=qrels_variant,
+        qrels_variant=qrels_name,  # <--- Usa il nome pulito qui
         results_dir=results_dir,
     )
 

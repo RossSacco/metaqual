@@ -1,13 +1,16 @@
 import os
 import re
 import glob
+from matplotlib.pyplot import stem
+from nltk.data import path
+from nltk.data import path
 import numpy as np
 import pandas as pd
 from statsmodels.stats.weightstats import ttost_paired
 from scipy import stats
 
 INPUT_DIR = "results2"
-BASE_DIR = "metaqual/utils/statistical/results_sts"
+BASE_DIR = "metaqual/utils/statistical/results_sts2"
 ALPHA = 0.05
 REL_LOWER_BOUND = 0.05
 VERY_LARGE_UPPER = 1e6
@@ -23,17 +26,42 @@ def paired_ci(diffs, alpha=0.05):
 
 def run_pruning_tost(path, alpha=0.05, rel_lower_bound=0.05, upper_bound=1e6):
     df = pd.read_csv(path)
-    m = re.search(
-        r"compare_all_(?P<scorer>[^_]+)_(?:(?P<qrels_variant>.+)_)?(?P<threshold>\d+(?:\.\d+)?)_perquery_wide\.csv",
-        os.path.basename(path)
-    )
-    if not m:
+    KNOWN_SCORERS = [
+        "finetuned_qualt5",
+        "perplexity",
+        "qualt5",
+        "tasb",
+        "itn",
+        "cdd",
+    ]
+    
+    name = os.path.basename(path)
+
+    if not name.startswith("compare_all_") or not name.endswith("_perquery_wide.csv"):
         raise ValueError(f"Filename non riconosciuto: {path}")
 
-    scorer = m.group("scorer")
-    qrels_variant = m.group("qrels_variant")
-    threshold = float(m.group("threshold"))
+    stem = name[len("compare_all_"):-len("_perquery_wide.csv")]
 
+# threshold = ultima parte dopo l'ultimo underscore
+    prefix, threshold_str = stem.rsplit("_", 1)
+    threshold = float(threshold_str)
+    
+    scorer = None
+    qrels_variant = None
+
+    for candidate in sorted(KNOWN_SCORERS, key=len, reverse=True):
+        if prefix == candidate:
+            scorer = candidate
+            qrels_variant = None
+            break
+        elif prefix.startswith(candidate + "_"):
+            scorer = candidate
+            qrels_variant = prefix[len(candidate) + 1:]
+            break
+
+    if scorer is None:
+        raise ValueError(f"Scorer non riconosciuto nel filename: {path}")
+    
     systems = ["BM25", "SPLADE", "TAS-B"]
     metrics = ["RR@10", "nDCG@10", "R@100"]
 

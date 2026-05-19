@@ -11,6 +11,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import pyterrier_dr
 import numpy as np
 from pyterrier_quality import QualT5, Filter
+from torch.nn import functional as F
 
 class TasbMagnitudeScorer(pt.Transformer):
     """
@@ -195,37 +196,41 @@ class CDDScorer(pt.Transformer):
 
 class FinetunedQualT5Scorer(pt.Transformer):
     """
-    Supervised QT5 passage quality scorer (query-independent) trained from
-    MSMARCO triples where query is intentionally ignored and:
-      - p+ -> "true"
-      - p- -> "false"
+    QualT5-style passage quality scorer.
 
-    Prompt format:
-      Document: {passage} Relevant:
+    Score computed:
+        quality = log P(true | true, false)
 
-    Final scoring, aligned with pyterrier-quality QualT5:
-      quality = log P(true | true,false)
+    Prompt:
+        Document: {passage} Relevant:
 
-    This is computed as:
-      log_softmax([logit_true, logit_false])[0]
+    The model predicts only between the two target tokens:
+        true / false
+
+    This implementation follows the optimization used in pyterrier-quality:
+    the lm_head is restricted to the rows corresponding to the target tokens.
     """
 
     def __init__(
         self,
         model_name_or_path,
-        batch_size=64,
-        max_length=256,
+        *,
+        batch_size=100,
+        max_length=512,
+        prompt="Document: {} Relevant:",
         device=None,
+        verbose=False,
     ):
         if not model_name_or_path:
             raise ValueError(
-                "Per 'finetuned_qualt5' devi specificare 'model_name_or_path' "
-                "nei kwargs o in config scorers.finetuned_qualt5."
+                "Per 'finetuned_qualt5' devi specificare 'model_name_or_path'."
             )
 
         self.model_name_or_path = model_name_or_path
         self.batch_size = int(batch_size)
         self.max_length = int(max_length)
+        self.prompt = prompt
+        self.verbose = verbose
         self.device = self._resolve_device(device)
 
         print(
@@ -234,22 +239,61 @@ class FinetunedQualT5Scorer(pt.Transformer):
             f"batch_size={self.batch_size}, max_length={self.max_length})..."
         )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name_or_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name_or_path,
+            use_fast=True,
+        )
+
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(
+            self.model_name_or_path
+        )
+
         self.model.to(self.device)
         self.model.eval()
 
-        self.true_token_id = self.tokenizer.encode(
-            "true", add_special_tokens=False
-        )[0]
-        self.false_token_id = self.tokenizer.encode(
-            "false", add_special_tokens=False
+        # Se il modello ha targets nel config, usa quelli.
+        # Altrimenti usa lo standard QualT5: ["true", "false"].
+        targets = (
+            self.model.config.targets
+            if hasattr(self.model.config, "targets")
+            else ["true", "false"]
+        )
+
+        if len(targets) != 2:
+            raise ValueError(
+                f"I targets devono essere esattamente 2, trovati: {targets}"
+            )
+
+        self.targets = targets
+
+        true_token_id = self.tokenizer.encode(
+            targets[0],
+            add_special_tokens=False,
         )[0]
 
-        if self.true_token_id is None or self.false_token_id is None:
-            raise RuntimeError(
-                "Tokenizzazione di 'true'/'false' non valida per questo tokenizer."
-            )
+        false_token_id = self.tokenizer.encode(
+            targets[1],
+            add_special_tokens=False,
+        )[0]
+
+        self.true_token_id = true_token_id
+        self.false_token_id = false_token_id
+
+        # Ottimizzazione pyterrier-quality:
+        # sostituisce la lm_head completa con una lm_head contenente solo
+        # i pesi dei token "true" e "false".
+        #
+        # Dopo questa modifica, il modello produce solo 2 logits:
+        #   posizione 0 -> true
+        #   posizione 1 -> false
+        with torch.no_grad():
+            restricted_lm_head_weight = self.model.lm_head.weight[
+                [self.true_token_id, self.false_token_id]
+            ].clone()
+
+        self.model.lm_head.weight = torch.nn.Parameter(
+            restricted_lm_head_weight
+        )
 
     def _resolve_device(self, requested_device):
         if requested_device:
@@ -261,25 +305,28 @@ class FinetunedQualT5Scorer(pt.Transformer):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _build_prompt(self, passage_text):
-        return f"Document: {passage_text} Relevant:"
+        return self.prompt.format(passage_text)
 
     def _score_batch(self, batch_texts):
         prompts = [self._build_prompt(t) for t in batch_texts]
 
-        encoded = self.tokenizer(
+        encoded = self.tokenizer.batch_encode_plus(
             prompts,
-            padding=True,
+            return_tensors="pt",
+            padding="longest",
             truncation=True,
             max_length=self.max_length,
-            return_tensors="pt",
         )
 
-        input_ids = encoded["input_ids"].to(self.device)
-        attention_mask = encoded["attention_mask"].to(self.device)
+        encoded = {
+            key: value.to(self.device)
+            for key, value in encoded.items()
+        }
 
-        batch_size = input_ids.size(0)
+        batch_size = len(batch_texts)
 
         decoder_start_token_id = self.model.config.decoder_start_token_id
+
         if decoder_start_token_id is None:
             decoder_start_token_id = self.tokenizer.pad_token_id
 
@@ -290,30 +337,26 @@ class FinetunedQualT5Scorer(pt.Transformer):
             device=self.device,
         )
 
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                decoder_input_ids=decoder_input_ids,
-            )
+        encoded["decoder_input_ids"] = decoder_input_ids
 
-            # Prima posizione del decoder: predizione del token dopo "Relevant:"
-            first_logits = outputs.logits[:, 0, :]
+        use_autocast = self.device.type == "cuda"
 
-            true_logits = first_logits[:, self.true_token_id]
-            false_logits = first_logits[:, self.false_token_id]
+        with torch.no_grad(), torch.autocast(
+            device_type=self.device.type,
+            enabled=use_autocast,
+        ):
+            outputs = self.model(**encoded)
 
-            true_false_logits = torch.stack(
-                [true_logits, false_logits],
-                dim=1,
-            )
+            # Prima posizione del decoder:
+            # predizione del primo token dopo "Relevant:"
+            logits = outputs.logits[:, 0]
 
-            # Score finale coerente a pyterrier-quality:
-            # log P(true | true,false)
-            quality_scores = torch.log_softmax(
-                true_false_logits,
-                dim=1,
-            )[:, 0]
+            # Dopo la riduzione della lm_head, logits ha dimensione:
+            # [batch_size, 2]
+            #
+            # logits[:, 0] = score per "true"
+            # logits[:, 1] = score per "false"
+            quality_scores = F.log_softmax(logits, dim=1)[:, 0]
 
         return quality_scores.detach().cpu().tolist()
 
@@ -326,14 +369,25 @@ class FinetunedQualT5Scorer(pt.Transformer):
             )
 
         texts = res["text"].astype(str).tolist()
+
         quality_scores = []
 
-        for start_idx in range(0, len(texts), self.batch_size):
+        iterator = range(0, len(texts), self.batch_size)
+
+        if self.verbose:
+            iterator = pt.tqdm(
+                iterator,
+                desc="FinetunedQualT5Scorer",
+                unit="batches",
+            )
+
+        for start_idx in iterator:
             batch_texts = texts[start_idx:start_idx + self.batch_size]
-            scores = self._score_batch(batch_texts)
-            quality_scores.extend(float(s) for s in scores)
+            batch_scores = self._score_batch(batch_texts)
+            quality_scores.extend(float(score) for score in batch_scores)
 
         res["quality"] = quality_scores
+
         return res
     
     
@@ -356,8 +410,8 @@ def get_scorer(nome_scorer, **kwargs):
     elif nome_scorer == 'finetuned_qualt5':
         return FinetunedQualT5Scorer(
             model_name_or_path=kwargs.get("model_name_or_path"),
-            batch_size=kwargs.get("batch_size", 64),
-            max_length=kwargs.get("max_length", 256),
+            batch_size=kwargs.get("batch_size", 100),
+            max_length=kwargs.get("max_length", 512),
             device=kwargs.get("device"),
         )
         

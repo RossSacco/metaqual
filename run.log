@@ -1,0 +1,2 @@
+nohup: ignoring input
+/home/sacco/metaqual/venv/bin/python: Error while finding module specification for 'metaqual.pruning.pruner' (ModuleNotFoundError: No module named 'metaqual')

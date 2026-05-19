@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 
-BASE_DIR = "metaqual/utils/statistical/results_sts"
+BASE_DIR = "metaqual/utils/statistical/results_sts2"
 INPUT_CSV = os.path.join(BASE_DIR, "tost_pruning_noninferiority_5pct_full_vs_pruned.csv")
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import yaml
 from metaqual.models.base_scorer import get_scorer
 from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 
-DEFAULT_SCORERS = ['qualt5', 'tasb', 'perplexity', 'itn', 'cdd']
+DEFAULT_SCORERS = ['qualt5', 'tasb', 'perplexity', 'itn', 'cdd', 'finetuned_qualt5']
 SUPPORTED_SCORERS = DEFAULT_SCORERS + ['finetuned_qualt5']
 
 
@@ -18,7 +18,7 @@ def checkpointed_iter(corpus_iter,dataset_name ,scorer_name, chunk_size=50000, c
     Wraps the corpus iterator. Saves progress to a text file
     and skips already processed documents on restart.
     """
-    ckpt_file = os.path.join(checkpoint_dir, f"{scorer_name}_{dataset_name}_checkpoint.txt")
+    ckpt_file = os.path.join(checkpoint_dir, f"{scorer_name}_{dataset_name}_checkpoint_NUOVO.txt")
     processed_docs = 0
     
     # 1. Restore from checkpoint
@@ -65,8 +65,8 @@ def cache_gen(name_scorer, dataset_name, path_output_base="./cache", resume=True
     scorer_transformer = get_scorer(name_scorer, **kwargs)
 
     # Output folder setup
-    percorso_cache = os.path.join(path_output_base, f"{name_scorer}_{dataset_name}.cache")
-    ckpt_file = os.path.join(path_output_base, f"{name_scorer}_{dataset_name}_checkpoint.txt")
+    percorso_cache = os.path.join(path_output_base, f"{name_scorer}_{dataset_name}_NUOVO.cache")
+    ckpt_file = os.path.join(path_output_base, f"{name_scorer}_{dataset_name}_checkpoint_NUOVO.txt")
     
     os.makedirs(path_output_base, exist_ok=True)
 

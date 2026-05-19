@@ -71,7 +71,7 @@ def run_full_pruning_and_indexing(config):
     # Gestione del parametro "all"
     if scorer_config == "all":
         # Inserisci qui l'elenco esatto degli scorer che vuoi eseguire
-        scorers_to_run = ["qualt5", "tasb", "perplexity", "itn", "cdd"]
+        scorers_to_run = ["qualt5", "tasb", "perplexity", "itn", "cdd", "finetuned_qualt5"]
     elif isinstance(scorer_config, list):
         scorers_to_run = scorer_config
     else:
