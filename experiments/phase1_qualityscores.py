@@ -9,8 +9,16 @@ import yaml
 from metaqual.models.base_scorer import get_scorer
 from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 
-DEFAULT_SCORERS = ['qualt5', 'tasb', 'perplexity', 'itn', 'cdd', 'finetuned_qualt5']
-SUPPORTED_SCORERS = DEFAULT_SCORERS + ['finetuned_qualt5']
+DEFAULT_SCORERS = [
+    'qualt5',
+    'tasb',
+    'perplexity',
+    'itn',
+    'cdd',
+    'finetuned_qualt5',
+    'metadata_qualt5',
+]
+SUPPORTED_SCORERS = DEFAULT_SCORERS + ['metadata_enriched_qualt5']
 
 
 def checkpointed_iter(corpus_iter,dataset_name ,scorer_name, chunk_size=50000, checkpoint_dir="./cache"):

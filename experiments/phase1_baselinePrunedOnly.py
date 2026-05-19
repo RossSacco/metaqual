@@ -17,7 +17,7 @@ from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 from metaqual.retrieval.pyterrier_pipe import RetrievalPipelines
 
 
-DEFAULT_SCORERS = ["tasb", "perplexity", "itn", "cdd", "finetuned_qualt5"]
+DEFAULT_SCORERS = ["tasb", "perplexity", "itn", "cdd", "finetuned_qualt5", "metadata_qualt5"]
 SUPPORTED_SCORERS = DEFAULT_SCORERS
 
 

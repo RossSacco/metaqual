@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 import nltk
 import math
+from pathlib import Path
 from collections import Counter
 import re
 import lmppl
@@ -12,6 +13,21 @@ import pyterrier_dr
 import numpy as np
 from pyterrier_quality import QualT5, Filter
 from torch.nn import functional as F
+
+try:
+    from metaqual.models.metadata_qualt5 import (
+        LexicalMetadataStore,
+        MetadataEnrichedQualT5,
+        MetadataFeatureScaler,
+        load_metadata_qualt5_config,
+    )
+except ImportError:
+    from models.metadata_qualt5 import (
+        LexicalMetadataStore,
+        MetadataEnrichedQualT5,
+        MetadataFeatureScaler,
+        load_metadata_qualt5_config,
+    )
 
 class TasbMagnitudeScorer(pt.Transformer):
     """
@@ -389,6 +405,250 @@ class FinetunedQualT5Scorer(pt.Transformer):
         res["quality"] = quality_scores
 
         return res
+
+
+class MetadataEnrichedQualT5Scorer(pt.Transformer):
+    """
+    Metadata-enriched QualT5 scorer.
+
+    Input columns required:
+      - docno
+      - text
+
+    Output column:
+      - quality
+    """
+
+    def __init__(
+        self,
+        model_name_or_path,
+        *,
+        metadata_path,
+        metadata_scaler_path=None,
+        lexical_feature_names=None,
+        batch_size=100,
+        max_length=512,
+        prompt="Document: {} Relevant:",
+        device=None,
+        scoring_mode="true_logprob",
+        allow_missing_metadata=False,
+        metadata_dropout=0.1,
+        metadata_mlp_hidden_dim=None,
+        attention_heads=8,
+        use_meta_ffn=True,
+        verbose=False,
+    ):
+        if not model_name_or_path:
+            raise ValueError(
+                "Per 'metadata_qualt5' devi specificare 'model_name_or_path'."
+            )
+        if not metadata_path:
+            raise ValueError(
+                "Per 'metadata_qualt5' devi specificare 'metadata_path'."
+            )
+
+        self.model_name_or_path = model_name_or_path
+        self.metadata_path = metadata_path
+        self.batch_size = int(batch_size)
+        self.max_length = int(max_length)
+        self.prompt = prompt
+        self.verbose = verbose
+        self.allow_missing_metadata = bool(allow_missing_metadata)
+        self.device = self._resolve_device(device)
+
+        saved_meta_cfg = load_metadata_qualt5_config(self.model_name_or_path)
+
+        if lexical_feature_names is None:
+            lexical_feature_names = saved_meta_cfg.get("lexical_feature_names")
+
+        self.lexical_store = LexicalMetadataStore.from_path(
+            self.metadata_path,
+            feature_names=lexical_feature_names,
+        )
+
+        scaler_candidate = metadata_scaler_path
+        if scaler_candidate is None:
+            scaler_candidate = saved_meta_cfg.get("metadata_scaler_path")
+        if scaler_candidate is not None:
+            scaler_candidate = str(scaler_candidate)
+            if not Path(scaler_candidate).is_absolute():
+                scaler_candidate = str(Path(self.model_name_or_path) / scaler_candidate)
+        if scaler_candidate is None:
+            scaler_candidate = str(
+                Path(self.model_name_or_path) / "metadata_scaler.pkl"
+            )
+        if scaler_candidate is None:
+            raise ValueError(
+                "metadata_scaler_path non specificato e non trovato nel config del modello."
+            )
+
+        self.scaler = MetadataFeatureScaler.load(scaler_candidate)
+        if list(self.lexical_store.feature_names) != list(self.scaler.feature_names):
+            self.lexical_store = LexicalMetadataStore.from_path(
+                self.metadata_path,
+                feature_names=self.scaler.feature_names,
+            )
+
+        print(
+            f"Inizializzazione MetadataEnrichedQualT5Scorer "
+            f"(model={self.model_name_or_path}, device={self.device}, "
+            f"batch_size={self.batch_size}, max_length={self.max_length})..."
+        )
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name_or_path,
+            use_fast=True,
+        )
+
+        targets = ["true", "false"]
+        true_token_id = self.tokenizer.encode(
+            targets[0],
+            add_special_tokens=False,
+        )[0]
+        false_token_id = self.tokenizer.encode(
+            targets[1],
+            add_special_tokens=False,
+        )[0]
+
+        if scoring_mode is None:
+            scoring_mode = saved_meta_cfg.get("scoring_mode", "true_logprob")
+
+        if "metadata_dropout" in saved_meta_cfg:
+            metadata_dropout = saved_meta_cfg["metadata_dropout"]
+        if "metadata_mlp_hidden_dim" in saved_meta_cfg and metadata_mlp_hidden_dim is None:
+            metadata_mlp_hidden_dim = saved_meta_cfg["metadata_mlp_hidden_dim"]
+        if "attention_heads" in saved_meta_cfg:
+            attention_heads = saved_meta_cfg["attention_heads"]
+        if "use_meta_ffn" in saved_meta_cfg:
+            use_meta_ffn = saved_meta_cfg["use_meta_ffn"]
+
+        self.model = MetadataEnrichedQualT5(
+            model_name_or_path=self.model_name_or_path,
+            lexical_feature_dim=len(self.lexical_store.feature_names),
+            true_token_id=true_token_id,
+            false_token_id=false_token_id,
+            scoring_mode=scoring_mode,
+            metadata_mlp_hidden_dim=metadata_mlp_hidden_dim,
+            metadata_dropout=float(metadata_dropout),
+            attention_heads=int(attention_heads),
+            use_meta_ffn=bool(use_meta_ffn),
+        )
+        self.model.load_metadata_modules(self.model_name_or_path)
+        self.model.to(self.device)
+        self.model.eval()
+
+        # Manteniamo lo stesso identico criterio di score finale di QualT5:
+        # quality = log_softmax([logit_true, logit_false])[:, 0]
+        self.model.scoring_mode = "true_logprob"
+
+    def _resolve_device(self, requested_device):
+        if requested_device:
+            if str(requested_device).startswith("cuda") and not torch.cuda.is_available():
+                print("[WARNING] CUDA richiesta ma non disponibile. Fallback su CPU.")
+                return torch.device("cpu")
+            return torch.device(requested_device)
+
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _build_prompt(self, passage_text):
+        return self.prompt.format(passage_text)
+
+    def _score_batch(self, batch_docnos, batch_texts):
+        prompts = [self._build_prompt(t) for t in batch_texts]
+
+        encoded = self.tokenizer.batch_encode_plus(
+            prompts,
+            return_tensors="pt",
+            padding="longest",
+            truncation=True,
+            max_length=self.max_length,
+        )
+
+        lexical_raw = self.lexical_store.lookup(
+            batch_docnos,
+            allow_missing_metadata=self.allow_missing_metadata,
+        )
+        lexical_norm = self.scaler.transform(lexical_raw)
+        lexical_features = torch.tensor(
+            lexical_norm,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        encoded = {
+            key: value.to(self.device)
+            for key, value in encoded.items()
+        }
+
+        batch_size = len(batch_texts)
+
+        decoder_start_token_id = self.model.base_model.config.decoder_start_token_id
+        if decoder_start_token_id is None:
+            decoder_start_token_id = self.tokenizer.pad_token_id
+
+        decoder_input_ids = torch.full(
+            (batch_size, 1),
+            decoder_start_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        use_autocast = self.device.type == "cuda"
+
+        with torch.no_grad(), torch.autocast(
+            device_type=self.device.type,
+            enabled=use_autocast,
+        ):
+            outputs = self.model(
+                input_ids=encoded["input_ids"],
+                attention_mask=encoded["attention_mask"],
+                lexical_features=lexical_features,
+                decoder_input_ids=decoder_input_ids,
+            )
+
+            # Calcolo finale allineato a FinetunedQualT5Scorer.
+            pair_logits = torch.stack(
+                [outputs["logits_true"], outputs["logits_false"]],
+                dim=1,
+            )
+            quality_scores = F.log_softmax(pair_logits, dim=1)[:, 0]
+
+        return quality_scores.detach().cpu().tolist()
+
+    def transform(self, df):
+        res = df.copy()
+
+        if "text" not in res.columns:
+            raise ValueError(
+                "MetadataEnrichedQualT5Scorer richiede una colonna 'text'."
+            )
+        if "docno" not in res.columns:
+            raise ValueError(
+                "MetadataEnrichedQualT5Scorer richiede una colonna 'docno'."
+            )
+
+        texts = res["text"].astype(str).tolist()
+        docnos = res["docno"].astype(str).tolist()
+
+        quality_scores = []
+
+        iterator = range(0, len(texts), self.batch_size)
+        if self.verbose:
+            iterator = pt.tqdm(
+                iterator,
+                desc="MetadataEnrichedQualT5Scorer",
+                unit="batches",
+            )
+
+        for start_idx in iterator:
+            end_idx = start_idx + self.batch_size
+            batch_texts = texts[start_idx:end_idx]
+            batch_docnos = docnos[start_idx:end_idx]
+            batch_scores = self._score_batch(batch_docnos, batch_texts)
+            quality_scores.extend(float(score) for score in batch_scores)
+
+        res["quality"] = quality_scores
+        return res
     
     
 def get_scorer(nome_scorer, **kwargs):
@@ -396,7 +656,8 @@ def get_scorer(nome_scorer, **kwargs):
     Initializes and returns the requested scorer ready for the PyTerrier pipeline.
     
     Arguments:
-    - nome_scorer: string ('qualt5', 'finetuned_qualt5', 'tasb', 'perplexity', 'itn', 'cdd')
+    - nome_scorer: string ('qualt5', 'finetuned_qualt5', 'metadata_qualt5',
+      'tasb', 'perplexity', 'itn', 'cdd')
     - kwargs: extra arguments (e.g., background_corpus for CDD)
     """
     nome_scorer = nome_scorer.lower()
@@ -413,6 +674,27 @@ def get_scorer(nome_scorer, **kwargs):
             batch_size=kwargs.get("batch_size", 100),
             max_length=kwargs.get("max_length", 512),
             device=kwargs.get("device"),
+        )
+
+    elif nome_scorer in ('metadata_qualt5', 'metadata_enriched_qualt5'):
+        lexical_feature_names = kwargs.get("lexical_feature_names")
+        if lexical_feature_names is None:
+            groups = kwargs.get("metadata_feature_groups", {})
+            lexical_feature_names = groups.get("lexical")
+        return MetadataEnrichedQualT5Scorer(
+            model_name_or_path=kwargs.get("model_name_or_path"),
+            metadata_path=kwargs.get("metadata_path"),
+            metadata_scaler_path=kwargs.get("metadata_scaler_path"),
+            lexical_feature_names=lexical_feature_names,
+            batch_size=kwargs.get("batch_size", 100),
+            max_length=kwargs.get("max_length", 512),
+            device=kwargs.get("device"),
+            scoring_mode=kwargs.get("scoring_mode", "true_logprob"),
+            allow_missing_metadata=kwargs.get("allow_missing_metadata", False),
+            metadata_dropout=kwargs.get("metadata_dropout", 0.1),
+            metadata_mlp_hidden_dim=kwargs.get("metadata_mlp_hidden_dim"),
+            attention_heads=kwargs.get("attention_heads", 8),
+            use_meta_ffn=kwargs.get("use_meta_ffn", True),
         )
         
     elif nome_scorer == 'tasb':

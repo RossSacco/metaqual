@@ -12,7 +12,7 @@ dataset:
 
 # Parametri Generali dell'Esperimento
 experiment:
-  scorer: "cdd"       # Opzioni: qualt5, finetuned_qualt5, tasb, perplexity, itn, cdd, all
+  scorer: "cdd"       # Opzioni: qualt5, finetuned_qualt5, metadata_qualt5, tasb, perplexity, itn, cdd, all
   threshold: 0.60         # Valore di pruning (es. 0.1 = 10%)
   restart_cache: false   # Se true, ignora i checkpoint e ricalcola tutto
   retriever: "all"    # Opzioni: "bm25", "splade", "tasb", o "all"
@@ -33,6 +33,42 @@ scorers:
     batch_size: 100
     max_length: 512
     device: "cuda"
+  metadata_qualt5:
+    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5/checkpoint-final"
+    metadata_path: "/home/sacco/metaqual/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet"
+    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5/metadata_scaler.pkl"
+    batch_size: 100
+    max_length: 512
+    device: "cuda"
+    scoring_mode: "true_logprob"
+    freeze_encoder: true
+    use_lora_decoder_cross_attention: false
+    allow_missing_metadata: false
+    metadata_dropout: 0.1
+    attention_heads: 8
+    use_meta_ffn: true
+    metadata_feature_groups:
+      lexical:
+        - length_tokens
+        - avg_token_length
+        - unique_token_ratio
+        - repetition_ratio
+        - lexical_entropy
+        - stopword_ratio
+        - content_word_ratio
+      embedding:
+        - embedding_l1_norm
+        - embedding_l2_norm
+        - embedding_linf_norm
+        - embedding_mean
+        - embedding_variance
+        - near_zero_fraction
+      token:
+        - mean_token_norm
+        - std_token_norm
+        - max_token_norm
+        - token_norm_entropy
+        - token_to_passage_similarity_mean
     
 
 # Parametri Avanzati (Opzionali, per tweaking)

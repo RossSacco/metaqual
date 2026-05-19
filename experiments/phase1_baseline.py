@@ -18,7 +18,7 @@ from metaqual.retrieval.pyterrier_pipe import RetrievalPipelines
 
 
 DEFAULT_SCORERS = ["qualt5", "tasb", "perplexity", "itn", "cdd"]
-SUPPORTED_SCORERS = DEFAULT_SCORERS + ["finetuned_qualt5"]
+SUPPORTED_SCORERS = DEFAULT_SCORERS + ["finetuned_qualt5", "metadata_qualt5", "metadata_enriched_qualt5"]
 
 
 # =========================================================
