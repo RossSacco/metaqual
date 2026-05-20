@@ -12,7 +12,7 @@ dataset:
 
 # Parametri Generali dell'Esperimento
 experiment:
-  scorer: "cdd"       # Opzioni: qualt5, finetuned_qualt5, metadata_qualt5, tasb, perplexity, itn, cdd, all
+  scorer: "metadata_qualt5"       # Opzioni: qualt5, finetuned_qualt5, metadata_qualt5, tasb, perplexity, itn, cdd, all
   threshold: 0.60         # Valore di pruning (es. 0.1 = 10%)
   restart_cache: false   # Se true, ignora i checkpoint e ricalcola tutto
   retriever: "all"    # Opzioni: "bm25", "splade", "tasb", o "all"
@@ -34,9 +34,9 @@ scorers:
     max_length: 512
     device: "cuda"
   metadata_qualt5:
-    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5/checkpoint-final"
-    metadata_path: "/home/sacco/metaqual/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet"
-    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5/metadata_scaler.pkl"
+    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-lr5e5-bs16-h256-3k"
+    metadata_path: "/home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet"
+    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-lr5e5-bs16-h256-3k/metadata_scaler.pkl"
     batch_size: 100
     max_length: 512
     device: "cuda"

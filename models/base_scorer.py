@@ -695,6 +695,7 @@ def get_scorer(nome_scorer, **kwargs):
             metadata_mlp_hidden_dim=kwargs.get("metadata_mlp_hidden_dim"),
             attention_heads=kwargs.get("attention_heads", 8),
             use_meta_ffn=kwargs.get("use_meta_ffn", True),
+            verbose=kwargs.get("verbose", False),
         )
         
     elif nome_scorer == 'tasb':
