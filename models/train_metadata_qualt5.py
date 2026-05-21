@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -11,28 +12,34 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 import yaml
-from transformers import Trainer, TrainingArguments
-from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, Trainer, TrainingArguments
 
 try:
-    from metaqual.data.loaders.msmarco.metadata_triples_dataset import MetadataQualT5TriplesIterableDataset
+    from metaqual.data.loaders.msmarco.metadata_triples_dataset import (
+        MetadataQualT5TriplesIterableDataset,
+    )
     from metaqual.models.metadata_qualt5 import (
+        EMBEDDING_FEATURE_NAMES,
+        TOKEN_FEATURE_NAMES,
         LexicalMetadataStore,
         MetadataEnrichedQualT5,
         MetadataFeatureScaler,
         RunningMoments,
-        EMBEDDING_FEATURE_NAMES,
-        TOKEN_FEATURE_NAMES,
+        fit_online_metadata_scalers,
     )
 except ImportError:
-    from data.loaders.msmarco.metadata_triples_dataset import MetadataQualT5TriplesIterableDataset
+    from data.loaders.msmarco.metadata_triples_dataset import (
+        MetadataQualT5TriplesIterableDataset,
+    )
     from models.metadata_qualt5 import (
+        EMBEDDING_FEATURE_NAMES,
+        TOKEN_FEATURE_NAMES,
         LexicalMetadataStore,
         MetadataEnrichedQualT5,
         MetadataFeatureScaler,
         RunningMoments,
-        EMBEDDING_FEATURE_NAMES,
-        TOKEN_FEATURE_NAMES,
+        fit_online_metadata_scalers,
     )
 
 
@@ -62,6 +69,7 @@ class MetadataQualT5Collator:
             [ex["lexical_features"] for ex in examples],
             dtype=torch.float32,
         )
+
         labels = torch.tensor(
             [ex["binary_labels"] for ex in examples],
             dtype=torch.long,
@@ -69,6 +77,7 @@ class MetadataQualT5Collator:
 
         encoded["lexical_features"] = lexical
         encoded["binary_labels"] = labels
+
         return encoded
 
 
@@ -121,6 +130,7 @@ def _log_cuda_status(prefix: str) -> None:
 def _log_path_status(path: str | Path, description: str) -> None:
     p = Path(path).expanduser()
     exists = p.exists()
+
     LOGGER.info("%s: %s", description, p)
     LOGGER.info("%s exists=%s", description, exists)
 
@@ -129,21 +139,47 @@ def _log_path_status(path: str | Path, description: str) -> None:
         LOGGER.info("%s size=%.3f GB", description, size_gb)
 
 
-def _default_scaler_path(output_dir: str) -> str:
-    return str(Path(output_dir) / "metadata_scaler.pkl")
+def _default_lexical_scaler_path(output_dir: str | Path) -> str:
+    return str(Path(output_dir) / "lexical_metadata_scaler.pkl")
 
 
+def _default_embedding_scaler_path(output_dir: str | Path) -> str:
+    return str(Path(output_dir) / "embedding_metadata_scaler.pkl")
+
+
+def _default_token_scaler_path(output_dir: str | Path) -> str:
+    return str(Path(output_dir) / "token_metadata_scaler.pkl")
+
+
+def _relative_if_inside_output(path: str | Path, output_dir: str | Path) -> str:
+    path = Path(path)
+    output_dir = Path(output_dir)
+
+    try:
+        if path.parent.resolve() == output_dir.resolve():
+            return path.name
+    except Exception:
+        pass
+
+    return str(path)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Training metadata_qualt5 a partire da un checkpoint QualT5 fine-tuned."
+        description="Training metadata-aware QualT5 from a fine-tuned QualT5 checkpoint."
     )
 
     parser.add_argument("--model_name_or_path", type=str, required=True)
     parser.add_argument("--metadata_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+
+    # Lexical scaler. Kept also as metadata_scaler_path for backward compatibility.
     parser.add_argument("--metadata_scaler_path", type=str, default=None)
+    parser.add_argument("--lexical_scaler_path", type=str, default=None)
+
+    # Online scalers for x_emb and x_tok.
+    parser.add_argument("--embedding_scaler_path", type=str, default=None)
+    parser.add_argument("--token_scaler_path", type=str, default=None)
 
     parser.add_argument("--triples_source", type=str, choices=["file", "irds"], default="file")
     parser.add_argument("--triples_path", type=str, default=None)
@@ -157,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
-    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--save_steps", type=int, default=1000)
     parser.add_argument("--save_total_limit", type=int, default=3)
@@ -165,28 +201,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
 
     parser.add_argument("--allow_missing_metadata", action="store_true")
+
+    # Lexical scaler fitting.
     parser.add_argument("--max_scaler_examples", type=int, default=500000)
     parser.add_argument(
         "--scaler_log_every",
         type=int,
         default=50_000,
-        help="Log progress every N examples during scaler fitting.",
+        help="Log progress every N examples during lexical scaler fitting.",
     )
 
-    parser.add_argument("--metadata_dropout", type=float, default=0.1)
+    # Online x_emb / x_tok scaler fitting.
+    parser.add_argument(
+        "--max_online_scaler_examples",
+        type=int,
+        default=100000,
+        help=(
+            "Maximum number of tokenized training examples used to fit x_emb and x_tok scalers. "
+            "Use -1 to scan all available examples."
+        ),
+    )
+    parser.add_argument(
+        "--online_scaler_batch_size",
+        type=int,
+        default=16,
+        help="Batch size used only for fitting x_emb and x_tok scalers.",
+    )
+
+    # New architecture defaults.
+    parser.add_argument("--metadata_dropout", type=float, default=0.0)
     parser.add_argument("--metadata_mlp_hidden_dim", type=int, default=None)
     parser.add_argument("--attention_heads", type=int, default=8)
     parser.add_argument("--disable_meta_ffn", action="store_true")
+
+    # New default: no LayerNorm on raw metadata features.
+    parser.add_argument(
+        "--normalize_metadata_features",
+        action="store_true",
+        help=(
+            "Enable LayerNorm before each metadata-group MLP. "
+            "Default is disabled because metadata are standardized with scalers."
+        ),
+    )
+
+    # Backward-compatible flag. If used, it forces normalization off.
     parser.add_argument(
         "--no_normalize_metadata_features",
         action="store_true",
-        help="Disable LayerNorm before each metadata-group MLP.",
+        help="Deprecated. Kept for backward compatibility. Forces metadata input normalization off.",
     )
 
     parser.add_argument(
-        "--no_unfreeze_last_decoder_block",
-        action="store_true",
-        help="Keep the last decoder block frozen. By default it is trainable.",
+        "--unfreeze_last_n_decoder_blocks",
+        type=int,
+        default=1,
+        help=(
+            "Number of final decoder blocks to unfreeze. "
+            "0 means only decoder cross-attention layers are trainable; "
+            "1 means unfreeze the last decoder block; "
+            "2 means unfreeze the last two decoder blocks, etc."
+        ),
     )
 
     parser.add_argument(
@@ -194,27 +268,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep the LM head frozen. By default it is trainable.",
     )
+
     parser.add_argument(
         "--metadata_fusion_mode",
         type=str,
-        choices=["concat_tokens", "gated_residual"],
-        default="gated_residual",
+        choices=["concat_tokens", "pooled_concat_projection"],
+        default="pooled_concat_projection",
         help=(
-            "How to fuse metadata after Uni-Attention. "
-            "'concat_tokens' keeps the old behaviour; "
-            "'gated_residual' injects pooled metadata into text hidden states."
+            "Recommended: pooled_concat_projection. "
+            "It computes meta_vec = mean(Z_meta_fused), repeats it over text tokens, "
+            "projects [H_text ; meta_vec], and builds H_fused = LayerNorm(H_text + metadata_update)."
         ),
     )
 
-    parser.add_argument(
-        "--metadata_gate_init_bias",
-        type=float,
-        default=-2.0,
-        help=(
-            "Initial bias for the metadata gate. "
-            "With -2.0, sigmoid(-2) is about 0.12, so metadata correction starts small."
-        ),
-    )
     parser.add_argument(
         "--scoring_mode",
         type=str,
@@ -228,17 +294,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _fit_scaler_on_training_docnos(
+def _fit_lexical_scaler_on_training_docnos(
     args: argparse.Namespace,
     tokenizer,
     lexical_store: LexicalMetadataStore,
 ) -> MetadataFeatureScaler:
-    LOGGER.info("Inizio fit scaler sui docno del training...")
-    _log_memory("Prima del fit scaler")
+    LOGGER.info("Inizio fit scaler sui metadata lessicali dei docno del training...")
+    _log_memory("Prima del fit lexical scaler")
 
     feature_dim = len(lexical_store.feature_names)
-    LOGGER.info("Feature dim scaler: %d", feature_dim)
-    LOGGER.info("Feature names: %s", lexical_store.feature_names)
+
+    LOGGER.info("Lexical feature dim: %d", feature_dim)
+    LOGGER.info("Lexical feature names: %s", lexical_store.feature_names)
 
     identity_scaler = MetadataFeatureScaler(
         feature_names=lexical_store.feature_names,
@@ -246,7 +313,6 @@ def _fit_scaler_on_training_docnos(
         std=np.ones(feature_dim, dtype=np.float32),
     )
 
-    LOGGER.info("Creo dataset temporaneo per fit scaler...")
     dataset_for_fit = MetadataQualT5TriplesIterableDataset(
         tokenizer=tokenizer,
         max_length=args.max_length,
@@ -260,34 +326,33 @@ def _fit_scaler_on_training_docnos(
         lexical_scaler=identity_scaler,
         allow_missing_metadata=args.allow_missing_metadata,
     )
-    LOGGER.info("Dataset temporaneo per fit scaler creato.")
 
     moments = RunningMoments(dim=feature_dim)
     start_time = time.time()
-
-    LOGGER.info("Inizio iterazione raw examples per fit scaler...")
 
     for idx, (docno, _passage, _label) in enumerate(dataset_for_fit.iter_raw_examples(), 1):
         values = lexical_store.lookup(
             [docno],
             allow_missing_metadata=args.allow_missing_metadata,
         )
+
         moments.update(values)
 
         if args.scaler_log_every > 0 and idx % args.scaler_log_every == 0:
             elapsed = time.time() - start_time
             examples_per_sec = idx / elapsed if elapsed > 0 else 0.0
+
             LOGGER.info(
-                "Scaler fit progress: %d esempi | %.2f ex/s | elapsed %.1f min",
+                "Lexical scaler fit progress: %d esempi | %.2f ex/s | elapsed %.1f min",
                 idx,
                 examples_per_sec,
                 elapsed / 60.0,
             )
-            _log_memory("Durante fit scaler")
+            _log_memory("Durante fit lexical scaler")
 
         if args.max_scaler_examples is not None and idx >= args.max_scaler_examples:
             LOGGER.info(
-                "Scaler fit stop anticipato su max_scaler_examples=%d",
+                "Lexical scaler fit stop anticipato su max_scaler_examples=%d",
                 args.max_scaler_examples,
             )
             break
@@ -296,16 +361,88 @@ def _fit_scaler_on_training_docnos(
 
     elapsed = time.time() - start_time
     LOGGER.info(
-        "Scaler fit completato su %d esempi in %.1f min.",
+        "Lexical scaler fit completato su %d esempi in %.1f min.",
         moments.count,
         elapsed / 60.0,
     )
-    _log_memory("Dopo fit scaler")
+    _log_memory("Dopo fit lexical scaler")
 
     return scaler
 
 
-def _save_reproducibility_files(args: argparse.Namespace, output_dir: str) -> None:
+def _fit_and_save_online_scalers(
+    args: argparse.Namespace,
+    tokenizer,
+    lexical_store: LexicalMetadataStore,
+    lexical_scaler: MetadataFeatureScaler,
+    embedding_scaler_path: str,
+    token_scaler_path: str,
+) -> tuple[MetadataFeatureScaler, MetadataFeatureScaler]:
+    LOGGER.info("Inizio fit scaler online per x_emb e x_tok...")
+    LOGGER.info("Embedding scaler path: %s", embedding_scaler_path)
+    LOGGER.info("Token scaler path: %s", token_scaler_path)
+
+    max_online_examples = args.max_online_scaler_examples
+    if max_online_examples is not None and max_online_examples < 0:
+        max_online_examples = None
+
+    max_batches = None
+    if max_online_examples is not None:
+        max_batches = math.ceil(max_online_examples / args.online_scaler_batch_size)
+
+    dataset_for_online_scaler = MetadataQualT5TriplesIterableDataset(
+        tokenizer=tokenizer,
+        max_length=args.max_length,
+        triples_source=args.triples_source,
+        triples_path=args.triples_path,
+        triples_format=args.triples_format,
+        collection_path=args.collection_path,
+        irds_dataset_id=args.irds_dataset_id,
+        max_irds_triples=args.max_irds_triples,
+        lexical_store=lexical_store,
+        lexical_scaler=lexical_scaler,
+        allow_missing_metadata=args.allow_missing_metadata,
+    )
+
+    dataloader_for_online_scaler = DataLoader(
+        dataset_for_online_scaler,
+        batch_size=args.online_scaler_batch_size,
+        collate_fn=MetadataQualT5Collator(tokenizer),
+        num_workers=0,
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    start_time = time.time()
+    emb_scaler, tok_scaler = fit_online_metadata_scalers(
+        model_name_or_path=args.model_name_or_path,
+        dataloader=dataloader_for_online_scaler,
+        device=device,
+        input_ids_key="input_ids",
+        attention_mask_key="attention_mask",
+        max_batches=max_batches,
+    )
+
+    emb_scaler.save(embedding_scaler_path)
+    tok_scaler.save(token_scaler_path)
+
+    elapsed = time.time() - start_time
+
+    LOGGER.info(
+        "Online scalers fit completato in %.1f min. max_online_examples=%s max_batches=%s",
+        elapsed / 60.0,
+        max_online_examples,
+        max_batches,
+    )
+    LOGGER.info("Embedding scaler salvato in: %s", embedding_scaler_path)
+    LOGGER.info("Token scaler salvato in: %s", token_scaler_path)
+
+    _log_memory("Dopo fit online scalers")
+
+    return emb_scaler, tok_scaler
+
+
+def _save_reproducibility_files(args: argparse.Namespace, output_dir: str | Path) -> None:
     LOGGER.info("Salvo file di riproducibilità...")
 
     args_dict = vars(args)
@@ -366,6 +503,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
     LOGGER.info("Output directory pronta: %s", output_dir.resolve())
 
     _log_path_status(args.model_name_or_path, "Model/checkpoint path")
@@ -380,6 +518,7 @@ def main() -> None:
     LOGGER.info("Carico tokenizer da: %s", args.model_name_or_path)
     tokenizer_start = time.time()
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+
     LOGGER.info(
         "Tokenizer caricato in %.2f sec. vocab_size=%s pad_token=%s eos_token=%s",
         time.time() - tokenizer_start,
@@ -392,6 +531,7 @@ def main() -> None:
     LOGGER.info("Carico lexical metadata da: %s", args.metadata_path)
     metadata_start = time.time()
     lexical_store = LexicalMetadataStore.from_path(args.metadata_path)
+
     LOGGER.info(
         "Lexical metadata caricati in %.2f sec. feature_dim=%d",
         time.time() - metadata_start,
@@ -400,19 +540,63 @@ def main() -> None:
     LOGGER.info("Lexical feature names: %s", lexical_store.feature_names)
     _log_memory("Dopo caricamento lexical metadata")
 
-    LOGGER.info("Inizio calcolo scaler metadata...")
-    scaler = _fit_scaler_on_training_docnos(
-        args=args,
-        tokenizer=tokenizer,
-        lexical_store=lexical_store,
+    # ------------------------------------------------------------------
+    # 1. Fit / load lexical scaler.
+    # ------------------------------------------------------------------
+    lexical_scaler_path = (
+        args.lexical_scaler_path
+        or args.metadata_scaler_path
+        or _default_lexical_scaler_path(args.output_dir)
     )
 
-    scaler_path = args.metadata_scaler_path or _default_scaler_path(args.output_dir)
-    LOGGER.info("Salvo scaler in: %s", scaler_path)
-    scaler.save(scaler_path)
-    LOGGER.info("Scaler salvato correttamente.")
-    _log_memory("Dopo salvataggio scaler")
+    if Path(lexical_scaler_path).exists():
+        LOGGER.info("Carico lexical scaler già esistente da: %s", lexical_scaler_path)
+        lexical_scaler = MetadataFeatureScaler.load(lexical_scaler_path)
+    else:
+        LOGGER.info("Lexical scaler non trovato. Lo calcolo ora...")
+        lexical_scaler = _fit_lexical_scaler_on_training_docnos(
+            args=args,
+            tokenizer=tokenizer,
+            lexical_store=lexical_store,
+        )
 
+        LOGGER.info("Salvo lexical scaler in: %s", lexical_scaler_path)
+        lexical_scaler.save(lexical_scaler_path)
+        LOGGER.info("Lexical scaler salvato correttamente.")
+
+    _log_memory("Dopo lexical scaler")
+
+    # ------------------------------------------------------------------
+    # 2. Fit / load online scalers for x_emb and x_tok.
+    # ------------------------------------------------------------------
+    embedding_scaler_path = args.embedding_scaler_path or _default_embedding_scaler_path(
+        args.output_dir
+    )
+    token_scaler_path = args.token_scaler_path or _default_token_scaler_path(args.output_dir)
+
+    embedding_exists = Path(embedding_scaler_path).exists()
+    token_exists = Path(token_scaler_path).exists()
+
+    if embedding_exists and token_exists:
+        LOGGER.info("Online scalers già esistenti. Skip fit.")
+        LOGGER.info("Embedding scaler: %s", embedding_scaler_path)
+        LOGGER.info("Token scaler: %s", token_scaler_path)
+    else:
+        LOGGER.info("Almeno uno tra embedding/token scaler non esiste. Calcolo online scalers...")
+        _fit_and_save_online_scalers(
+            args=args,
+            tokenizer=tokenizer,
+            lexical_store=lexical_store,
+            lexical_scaler=lexical_scaler,
+            embedding_scaler_path=embedding_scaler_path,
+            token_scaler_path=token_scaler_path,
+        )
+
+    _log_memory("Dopo online scalers")
+
+    # ------------------------------------------------------------------
+    # 3. Token ids for true/false.
+    # ------------------------------------------------------------------
     LOGGER.info("Calcolo token id per true/false...")
     true_token_ids = tokenizer.encode("true", add_special_tokens=False)
     false_token_ids = tokenizer.encode("false", add_special_tokens=False)
@@ -420,12 +604,29 @@ def main() -> None:
     LOGGER.info("true_token_ids=%s", true_token_ids)
     LOGGER.info("false_token_ids=%s", false_token_ids)
 
+    if len(true_token_ids) == 0 or len(false_token_ids) == 0:
+        raise ValueError("Non riesco a ricavare true_token_id o false_token_id.")
+
     true_token_id = true_token_ids[0]
     false_token_id = false_token_ids[0]
 
     LOGGER.info("true_token_id=%s | false_token_id=%s", true_token_id, false_token_id)
 
+    # ------------------------------------------------------------------
+    # 4. Create model.
+    # ------------------------------------------------------------------
+    normalize_metadata_features = (
+        bool(args.normalize_metadata_features)
+        and not bool(args.no_normalize_metadata_features)
+    )
+
     LOGGER.info("Creo modello MetadataEnrichedQualT5...")
+    LOGGER.info("metadata_dropout=%s", args.metadata_dropout)
+    LOGGER.info("normalize_metadata_features=%s", normalize_metadata_features)
+    LOGGER.info("embedding_feature_scaler_path=%s", embedding_scaler_path)
+    LOGGER.info("token_feature_scaler_path=%s", token_scaler_path)
+    LOGGER.info("lexical_features are already scaled by the dataset; no lexical scaler is passed to model.")
+
     model_start = time.time()
     model = MetadataEnrichedQualT5(
         model_name_or_path=args.model_name_or_path,
@@ -437,13 +638,16 @@ def main() -> None:
         metadata_dropout=args.metadata_dropout,
         attention_heads=args.attention_heads,
         use_meta_ffn=not args.disable_meta_ffn,
-        normalize_metadata_features=not args.no_normalize_metadata_features,
-        unfreeze_last_decoder_block=not args.no_unfreeze_last_decoder_block,
+        normalize_metadata_features=normalize_metadata_features,
+        unfreeze_last_n_decoder_blocks=args.unfreeze_last_n_decoder_blocks,
         unfreeze_lm_head=not args.no_unfreeze_lm_head,
         metadata_fusion_mode=args.metadata_fusion_mode,
-        metadata_gate_init_bias=args.metadata_gate_init_bias,
+        lexical_feature_scaler_path=None,
+        embedding_feature_scaler_path=embedding_scaler_path,
+        token_feature_scaler_path=token_scaler_path,
     )
     LOGGER.info("Modello creato in %.2f sec.", time.time() - model_start)
+
     _log_model_device(model, "Dopo creazione modello")
     _log_memory("Dopo creazione modello")
     _log_cuda_status("Dopo creazione modello")
@@ -451,6 +655,25 @@ def main() -> None:
     stats = model.get_trainable_parameter_stats()
     LOGGER.info("Trainable parameters: %s / %s", stats["trainable"], stats["total"])
 
+    if hasattr(model, "get_trainable_parameter_summary"):
+        summary = model.get_trainable_parameter_summary(max_items=160)
+        LOGGER.info(
+            "Trainable tensors: %d | total_trainable=%d",
+            summary["num_trainable_tensors"],
+            summary["total_trainable"],
+        )
+
+        for item in summary["trainable_preview"]:
+            LOGGER.info(
+                "TRAINABLE | %s | shape=%s | params=%d",
+                item["name"],
+                item["shape"],
+                item["num_params"],
+            )
+
+    # ------------------------------------------------------------------
+    # 5. Training dataset.
+    # ------------------------------------------------------------------
     LOGGER.info("Creo train_dataset...")
     dataset_start = time.time()
     train_dataset = MetadataQualT5TriplesIterableDataset(
@@ -463,12 +686,15 @@ def main() -> None:
         irds_dataset_id=args.irds_dataset_id,
         max_irds_triples=args.max_irds_triples,
         lexical_store=lexical_store,
-        lexical_scaler=scaler,
+        lexical_scaler=lexical_scaler,
         allow_missing_metadata=args.allow_missing_metadata,
     )
     LOGGER.info("train_dataset creato in %.2f sec.", time.time() - dataset_start)
     _log_memory("Dopo creazione train_dataset")
 
+    # ------------------------------------------------------------------
+    # 6. Trainer.
+    # ------------------------------------------------------------------
     LOGGER.info("Creo TrainingArguments...")
     training_args = TrainingArguments(
         output_dir=str(output_dir),
@@ -505,6 +731,7 @@ def main() -> None:
         tokenizer=tokenizer,
     )
     LOGGER.info("Trainer creato in %.2f sec.", time.time() - trainer_start)
+
     _log_model_device(model, "Dopo creazione Trainer")
     _log_memory("Dopo creazione Trainer")
     _log_cuda_status("Dopo creazione Trainer")
@@ -517,17 +744,21 @@ def main() -> None:
     train_start = time.time()
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     LOGGER.info("Training finito in %.1f min.", (time.time() - train_start) / 60.0)
+
     _log_model_device(model, "Dopo training")
     _log_memory("Dopo training")
 
+    # ------------------------------------------------------------------
+    # 7. Save.
+    # ------------------------------------------------------------------
     LOGGER.info("Salvo checkpoint finale base_model + tokenizer...")
     model.base_model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     LOGGER.info("Base model e tokenizer salvati.")
 
-    scaler_cfg_value = str(scaler_path)
-    if Path(scaler_path).parent.resolve() == output_dir.resolve():
-        scaler_cfg_value = Path(scaler_path).name
+    lexical_scaler_cfg_value = _relative_if_inside_output(lexical_scaler_path, output_dir)
+    embedding_scaler_cfg_value = _relative_if_inside_output(embedding_scaler_path, output_dir)
+    token_scaler_cfg_value = _relative_if_inside_output(token_scaler_path, output_dir)
 
     metadata_config = {
         "model_type": "metadata_qualt5",
@@ -540,18 +771,23 @@ def main() -> None:
         "metadata_mlp_hidden_dim": args.metadata_mlp_hidden_dim,
         "attention_heads": args.attention_heads,
         "use_meta_ffn": not args.disable_meta_ffn,
-        "normalize_metadata_features": not args.no_normalize_metadata_features,
-        "unfreeze_last_decoder_block": not args.no_unfreeze_last_decoder_block,
+        "normalize_metadata_features": normalize_metadata_features,
+        "unfreeze_last_n_decoder_blocks": args.unfreeze_last_n_decoder_blocks,
         "unfreeze_lm_head": not args.no_unfreeze_lm_head,
         "metadata_fusion_mode": args.metadata_fusion_mode,
-        "metadata_gate_init_bias": args.metadata_gate_init_bias,
-        "metadata_scaler_path": scaler_cfg_value,
+        "lexical_scaler_path": lexical_scaler_cfg_value,
+        "metadata_scaler_path": lexical_scaler_cfg_value,
+        "embedding_scaler_path": embedding_scaler_cfg_value,
+        "token_scaler_path": token_scaler_cfg_value,
+        "embedding_feature_scaler_path": embedding_scaler_cfg_value,
+        "token_feature_scaler_path": token_scaler_cfg_value,
     }
+
     LOGGER.info("Salvo metadata modules...")
     model.save_metadata_modules(output_dir, metadata_config)
     LOGGER.info("Metadata modules salvati.")
 
-    _save_reproducibility_files(args, str(output_dir))
+    _save_reproducibility_files(args, output_dir)
 
     meta_yaml_path = output_dir / "metadata_feature_config.yaml"
     LOGGER.info("Salvo metadata_feature_config.yaml in: %s", meta_yaml_path)
@@ -565,7 +801,12 @@ def main() -> None:
                             "lexical": lexical_store.feature_names,
                             "embedding": EMBEDDING_FEATURE_NAMES,
                             "token": TOKEN_FEATURE_NAMES,
-                        }
+                        },
+                        "scalers": {
+                            "lexical": lexical_scaler_cfg_value,
+                            "embedding": embedding_scaler_cfg_value,
+                            "token": token_scaler_cfg_value,
+                        },
                     }
                 }
             },
@@ -582,29 +823,32 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     
-'''
+    
+"""
 CUDA_VISIBLE_DEVICES=1 \
 NCCL_P2P_DISABLE=1 \
 NCCL_IB_DISABLE=1 \
 nohup python -u -m metaqual.models.train_metadata_qualt5 \
   --model_name_or_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
   --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
-  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-gated-lr2e5-h256-10k \
+  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-SS-h256-10k \
   --triples_source irds \
   --irds_dataset_id msmarco-passage/train/triples-small \
   --max_steps 10000 \
   --per_device_train_batch_size 8 \
   --gradient_accumulation_steps 2 \
-  --learning_rate 2e-5 \
+  --learning_rate 5e-5 \
   --max_length 512 \
   --save_steps 1000 \
   --save_total_limit 3 \
   --logging_steps 50 \
+  --metadata_dropout 0.0 \
   --metadata_mlp_hidden_dim 256 \
-  --metadata_fusion_mode gated_residual \
-  --metadata_gate_init_bias -2.0 \
+  --metadata_fusion_mode pooled_concat_projection \
+  --unfreeze_last_n_decoder_blocks 1 \
+  --max_scaler_examples 500000 \
+  --max_online_scaler_examples 100000 \
+  --online_scaler_batch_size 16 \
   --bf16 \
-  > metaqualt5_gated.log 2>&1 &
-
-
-'''
+  > metaqualt5_ft.log 2>&1 &
+"""

@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Diagnostic evaluation: compare text-only QualT5 vs MetadataQualT5 "
-            "on balanced positive/negative passages, optionally skipping raw train examples."
+            "on balanced positive/negative passages."
         )
     )
 
@@ -50,7 +50,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata_model_path", type=str, required=True)
 
     parser.add_argument("--metadata_path", type=str, required=True)
-    parser.add_argument("--metadata_scaler_path", type=str, required=True)
+
+    # Backward-compatible name for lexical scaler.
+    parser.add_argument("--metadata_scaler_path", type=str, default=None)
+
+    # New explicit scaler paths.
+    parser.add_argument("--lexical_scaler_path", type=str, default=None)
+    parser.add_argument("--embedding_scaler_path", type=str, default=None)
+    parser.add_argument("--token_scaler_path", type=str, default=None)
 
     parser.add_argument("--output_dir", type=str, required=True)
 
@@ -72,10 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--bf16", action="store_true")
 
-    parser.add_argument("--metadata_dropout", type=float, default=0.1)
+    # New architecture defaults.
+    parser.add_argument("--metadata_dropout", type=float, default=0.0)
     parser.add_argument("--metadata_mlp_hidden_dim", type=int, default=None)
     parser.add_argument("--attention_heads", type=int, default=8)
     parser.add_argument("--disable_meta_ffn", action="store_true")
+
     parser.add_argument(
         "--scoring_mode",
         type=str,
@@ -89,8 +98,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help=(
             "Number of raw examples to skip before collecting the diagnostic sample. "
-            "Useful to avoid evaluating on examples probably already seen during training. "
-            "For example: max_steps * batch_size * gradient_accumulation_steps."
+            "Useful to avoid evaluating on examples probably already seen during training."
         ),
     )
 
@@ -108,36 +116,48 @@ def parse_args() -> argparse.Namespace:
         "--prune_fractions",
         type=str,
         default="0.15,0.25,0.30,0.45",
+        help="Comma-separated pruning fractions. Example: 0.15,0.25,0.30,0.45",
+    )
+
+    parser.add_argument(
+        "--normalize_metadata_features",
+        action="store_true",
         help=(
-            "Comma-separated pruning fractions. "
-            "Example: 0.15,0.25,0.30,0.45"
+            "Enable LayerNorm before each metadata-group MLP. "
+            "Default is disabled because features are standardized with scalers."
         ),
     )
 
     parser.add_argument(
         "--no_normalize_metadata_features",
         action="store_true",
-        help=(
-            "Disable LayerNorm before each metadata-group MLP. "
-            "Use this when evaluating old checkpoints trained without metadata feature normalization."
-        ),
+        help="Deprecated. Kept for backward compatibility. Forces normalization off.",
     )
 
     parser.add_argument(
-        "--no_unfreeze_last_decoder_block",
-        action="store_true",
+        "--unfreeze_last_n_decoder_blocks",
+        type=int,
+        default=1,
         help=(
-            "Keep the last decoder block frozen when instantiating the model. "
-            "This must match the checkpoint architecture/training config."
+            "Number of final decoder blocks to unfreeze when instantiating the model. "
+            "Must match the checkpoint config."
         ),
     )
 
     parser.add_argument(
         "--no_unfreeze_lm_head",
         action="store_true",
+        help="Keep LM head frozen when instantiating the model.",
+    )
+
+    parser.add_argument(
+        "--metadata_fusion_mode",
+        type=str,
+        choices=["concat_tokens", "pooled_concat_projection"],
+        default="pooled_concat_projection",
         help=(
-            "Keep the LM head frozen when instantiating the model. "
-            "This must match the checkpoint architecture/training config."
+            "New architecture default: pooled_concat_projection. "
+            "It computes meta_vec = mean(Z_meta_fused), then H_fused = LayerNorm(H_text + MLP([H_text; meta_vec]))."
         ),
     )
 
@@ -152,14 +172,17 @@ def setup_logging() -> None:
 
 
 def parse_prune_fractions(value: str) -> list[float]:
-    fractions = []
+    fractions: list[float] = []
+
     for part in value.split(","):
         part = part.strip()
         if not part:
             continue
+
         frac = float(part)
         if frac < 0.0 or frac > 1.0:
             raise ValueError(f"Invalid prune fraction: {frac}")
+
         fractions.append(frac)
 
     if not fractions:
@@ -187,6 +210,60 @@ def get_true_false_token_ids(tokenizer) -> tuple[int, int]:
     return true_ids[0], false_ids[0]
 
 
+def _safe_load_metadata_config(model_path: str | Path) -> Dict[str, Any]:
+    try:
+        cfg = load_metadata_qualt5_config(model_path)
+        if cfg:
+            LOGGER.info("metadata_qualt5_config.json caricato da %s", model_path)
+            LOGGER.info("Metadata config: %s", cfg)
+        else:
+            LOGGER.warning(
+                "metadata_qualt5_config.json non trovato o vuoto in %s. Uso valori CLI.",
+                model_path,
+            )
+        return cfg or {}
+    except Exception as exc:
+        LOGGER.warning(
+            "Impossibile caricare metadata_qualt5_config.json da %s: %s. Uso valori CLI.",
+            model_path,
+            exc,
+        )
+        return {}
+
+
+def _resolve_model_relative_path(
+    path_value: Optional[str],
+    model_dir: str | Path,
+) -> Optional[str]:
+    if path_value is None:
+        return None
+
+    p = Path(path_value)
+
+    if p.is_absolute():
+        return str(p)
+
+    candidate = Path(model_dir) / p
+    return str(candidate)
+
+
+def _get_cfg_path(
+    args_value: Optional[str],
+    metadata_cfg: Dict[str, Any],
+    cfg_keys: list[str],
+    model_dir: str | Path,
+) -> Optional[str]:
+    if args_value is not None:
+        return args_value
+
+    for key in cfg_keys:
+        value = metadata_cfg.get(key)
+        if value:
+            return _resolve_model_relative_path(str(value), model_dir)
+
+    return None
+
+
 def validate_scaler_features(
     scaler: MetadataFeatureScaler,
     lexical_store: LexicalMetadataStore,
@@ -202,7 +279,7 @@ def validate_scaler_features(
         )
 
 
-def load_or_init_identity_scaler(lexical_store: LexicalMetadataStore) -> MetadataFeatureScaler:
+def load_identity_scaler(lexical_store: LexicalMetadataStore) -> MetadataFeatureScaler:
     feature_dim = len(lexical_store.feature_names)
 
     return MetadataFeatureScaler(
@@ -235,7 +312,7 @@ def collect_balanced_examples(
             args.max_raw_scan,
         )
 
-    identity_scaler = load_or_init_identity_scaler(lexical_store)
+    identity_scaler = load_identity_scaler(lexical_store)
 
     dataset = MetadataQualT5TriplesIterableDataset(
         tokenizer=tokenizer,
@@ -269,10 +346,7 @@ def collect_balanced_examples(
         scanned_after_skip += 1
 
         if args.max_raw_scan is not None and scanned_after_skip > args.max_raw_scan:
-            LOGGER.info(
-                "Stop per max_raw_scan=%d dopo lo skip.",
-                args.max_raw_scan,
-            )
+            LOGGER.info("Stop per max_raw_scan=%d dopo lo skip.", args.max_raw_scan)
             break
 
         label_int = int(label)
@@ -311,9 +385,7 @@ def collect_balanced_examples(
     if len(positives) < args.sample_per_class or len(negatives) < args.sample_per_class:
         raise RuntimeError(
             f"Campionamento incompleto: pos={len(positives)}, neg={len(negatives)}. "
-            f"Richiesti {args.sample_per_class} per classe. "
-            f"Prova a ridurre --sample_per_class, ridurre --skip_first_raw_examples, "
-            f"oppure aumentare/rimuovere --max_raw_scan."
+            f"Richiesti {args.sample_per_class} per classe."
         )
 
     df = pd.DataFrame(positives + negatives)
@@ -326,12 +398,6 @@ def collect_balanced_examples(
         "Raw index range nel campione: min=%d | max=%d",
         int(df["raw_example_index"].min()),
         int(df["raw_example_index"].max()),
-    )
-
-    LOGGER.info(
-        "Scanned-after-skip range nel campione: min=%d | max=%d",
-        int(df["scanned_after_skip_index"].min()),
-        int(df["scanned_after_skip_index"].max()),
     )
 
     return df
@@ -423,39 +489,17 @@ def scale_metadata_features(
     return ((values.astype(np.float32) - mean) / std).astype(np.float32)
 
 
-def _safe_load_metadata_config(model_path: str | Path) -> Dict[str, Any]:
-    try:
-        cfg = load_metadata_qualt5_config(model_path)
-        if cfg:
-            LOGGER.info("metadata_qualt5_config.json caricato da %s", model_path)
-            LOGGER.info("Metadata config: %s", cfg)
-        else:
-            LOGGER.warning(
-                "metadata_qualt5_config.json non trovato o vuoto in %s. "
-                "Uso i valori da CLI.",
-                model_path,
-            )
-        return cfg or {}
-    except Exception as exc:
-        LOGGER.warning(
-            "Impossibile caricare metadata_qualt5_config.json da %s: %s. "
-            "Uso i valori da CLI.",
-            model_path,
-            exc,
-        )
-        return {}
-
-
 def load_metadata_model(
     args: argparse.Namespace,
     device: torch.device,
     true_token_id: int,
     false_token_id: int,
     lexical_feature_dim: int,
+    metadata_cfg: Dict[str, Any],
+    embedding_scaler_path: Optional[str],
+    token_scaler_path: Optional[str],
 ):
     LOGGER.info("Carico MetadataEnrichedQualT5 da: %s", args.metadata_model_path)
-
-    metadata_cfg = _safe_load_metadata_config(args.metadata_model_path)
 
     scoring_mode = metadata_cfg.get("scoring_mode", args.scoring_mode)
     metadata_dropout = metadata_cfg.get("metadata_dropout", args.metadata_dropout)
@@ -468,75 +512,73 @@ def load_metadata_model(
 
     normalize_metadata_features = metadata_cfg.get(
         "normalize_metadata_features",
-        not args.no_normalize_metadata_features,
+        bool(args.normalize_metadata_features) and not bool(args.no_normalize_metadata_features),
     )
-    unfreeze_last_decoder_block = metadata_cfg.get(
-        "unfreeze_last_decoder_block",
-        not args.no_unfreeze_last_decoder_block,
+
+    unfreeze_last_n_decoder_blocks = metadata_cfg.get(
+        "unfreeze_last_n_decoder_blocks",
+        args.unfreeze_last_n_decoder_blocks,
     )
+
     unfreeze_lm_head = metadata_cfg.get(
         "unfreeze_lm_head",
         not args.no_unfreeze_lm_head,
     )
 
+    metadata_fusion_mode = metadata_cfg.get(
+        "metadata_fusion_mode",
+        args.metadata_fusion_mode,
+    )
+
+    if metadata_fusion_mode == "gated_residual":
+        raise ValueError(
+            "Il checkpoint/config indica metadata_fusion_mode='gated_residual', "
+            "ma la nuova architettura usa 'pooled_concat_projection'. "
+            "Assicurati di valutare un checkpoint addestrato con la nuova architettura."
+        )
+
     LOGGER.info(
         "Metadata model init config | scoring_mode=%s | dropout=%s | hidden_dim=%s | "
         "attention_heads=%s | use_meta_ffn=%s | normalize_metadata_features=%s | "
-        "unfreeze_last_decoder_block=%s | unfreeze_lm_head=%s",
+        "unfreeze_last_n_decoder_blocks=%s | unfreeze_lm_head=%s | "
+        "metadata_fusion_mode=%s | embedding_scaler_path=%s | token_scaler_path=%s",
         scoring_mode,
         metadata_dropout,
         metadata_mlp_hidden_dim,
         attention_heads,
         use_meta_ffn,
         normalize_metadata_features,
-        unfreeze_last_decoder_block,
+        unfreeze_last_n_decoder_blocks,
         unfreeze_lm_head,
+        metadata_fusion_mode,
+        embedding_scaler_path,
+        token_scaler_path,
     )
 
-    try:
-        model = MetadataEnrichedQualT5(
-            model_name_or_path=args.metadata_model_path,
-            lexical_feature_dim=lexical_feature_dim,
-            true_token_id=true_token_id,
-            false_token_id=false_token_id,
-            scoring_mode=scoring_mode,
-            metadata_mlp_hidden_dim=metadata_mlp_hidden_dim,
-            metadata_dropout=metadata_dropout,
-            attention_heads=attention_heads,
-            use_meta_ffn=use_meta_ffn,
-            normalize_metadata_features=normalize_metadata_features,
-            unfreeze_last_decoder_block=unfreeze_last_decoder_block,
-            unfreeze_lm_head=unfreeze_lm_head,
-        )
-    except TypeError as exc:
-        LOGGER.warning(
-            "Costruttore MetadataEnrichedQualT5 non accetta i nuovi flag. "
-            "Riprovo con la vecchia firma. Errore originale: %s",
-            exc,
-        )
-        model = MetadataEnrichedQualT5(
-            model_name_or_path=args.metadata_model_path,
-            lexical_feature_dim=lexical_feature_dim,
-            true_token_id=true_token_id,
-            false_token_id=false_token_id,
-            scoring_mode=scoring_mode,
-            metadata_mlp_hidden_dim=metadata_mlp_hidden_dim,
-            metadata_dropout=metadata_dropout,
-            attention_heads=attention_heads,
-            use_meta_ffn=use_meta_ffn,
-        )
-
-    loaded_metadata_modules = False
+    model = MetadataEnrichedQualT5(
+        model_name_or_path=args.metadata_model_path,
+        lexical_feature_dim=lexical_feature_dim,
+        true_token_id=true_token_id,
+        false_token_id=false_token_id,
+        scoring_mode=scoring_mode,
+        metadata_mlp_hidden_dim=metadata_mlp_hidden_dim,
+        metadata_dropout=metadata_dropout,
+        attention_heads=attention_heads,
+        use_meta_ffn=use_meta_ffn,
+        normalize_metadata_features=normalize_metadata_features,
+        unfreeze_last_n_decoder_blocks=unfreeze_last_n_decoder_blocks,
+        unfreeze_lm_head=unfreeze_lm_head,
+        metadata_fusion_mode=metadata_fusion_mode,
+        lexical_feature_scaler_path=None,
+        embedding_feature_scaler_path=embedding_scaler_path,
+        token_feature_scaler_path=token_scaler_path,
+    )
 
     if hasattr(model, "load_metadata_modules"):
-        LOGGER.info("Trovato metodo load_metadata_modules(...). Carico moduli metadata.")
+        LOGGER.info("Carico moduli metadata da checkpoint...")
         model.load_metadata_modules(args.metadata_model_path)
-        loaded_metadata_modules = True
     else:
-        LOGGER.warning(
-            "Il modello non espone load_metadata_modules(...). "
-            "Assumo che MetadataEnrichedQualT5 carichi i moduli metadata automaticamente."
-        )
+        LOGGER.warning("Il modello non espone load_metadata_modules(...).")
 
     model.to(device)
     model.eval()
@@ -546,8 +588,6 @@ def load_metadata_model(
         LOGGER.info("Metadata model device=%s dtype=%s", first_param.device, first_param.dtype)
     except StopIteration:
         LOGGER.warning("Metadata model senza parametri?")
-
-    LOGGER.info("Metadata modules loaded explicitly: %s", loaded_metadata_modules)
 
     return model
 
@@ -572,10 +612,14 @@ def extract_scores_from_metadata_output(
             if key in outputs:
                 return outputs[key].view(-1)
 
-        if "logits" in outputs:
-            logits = outputs["logits"]
-        elif "decoder_logits" in outputs:
+        if "decoder_logits" in outputs:
             logits = outputs["decoder_logits"]
+        elif "pair_logits" in outputs:
+            pair_logits = outputs["pair_logits"]
+            log_probs = torch.log_softmax(pair_logits, dim=-1)
+            return log_probs[:, 0]
+        elif "logits" in outputs:
+            logits = outputs["logits"]
         else:
             raise RuntimeError(
                 f"Output dict senza chiave score/logits. Keys: {list(outputs.keys())}"
@@ -615,7 +659,7 @@ def score_metadata_model(
     model,
     tokenizer,
     lexical_store: LexicalMetadataStore,
-    scaler: MetadataFeatureScaler,
+    lexical_scaler: MetadataFeatureScaler,
     df: pd.DataFrame,
     args: argparse.Namespace,
     device: torch.device,
@@ -647,7 +691,7 @@ def score_metadata_model(
             allow_missing_metadata=args.allow_missing_metadata,
         )
         raw_metadata = np.asarray(raw_metadata, dtype=np.float32)
-        scaled_metadata = scale_metadata_features(scaler, raw_metadata)
+        scaled_metadata = scale_metadata_features(lexical_scaler, raw_metadata)
 
         batch = {
             "input_ids": encoded["input_ids"].to(device),
@@ -689,7 +733,7 @@ def summarize_scores(labels: np.ndarray, scores: np.ndarray, name: str) -> dict[
     preds = (scores >= threshold).astype(int)
     acc_median_threshold = accuracy_score(labels, preds)
 
-    summary = {
+    return {
         "model": name,
         "auc": float(auc),
         "accuracy_median_threshold": float(acc_median_threshold),
@@ -705,8 +749,6 @@ def summarize_scores(labels: np.ndarray, scores: np.ndarray, name: str) -> dict[
         "mean_gap_pos_minus_neg": float(np.mean(pos_scores) - np.mean(neg_scores)),
     }
 
-    return summary
-
 
 def compute_pruning_metrics(
     df: pd.DataFrame,
@@ -714,15 +756,6 @@ def compute_pruning_metrics(
     model_name: str,
     prune_fractions: list[float],
 ) -> list[dict[str, Any]]:
-    """
-    Simulates static pruning by removing the lowest-scored passages.
-
-    Assumption:
-    - lower score = lower estimated passage quality
-    - label = 1 means positive/relevant
-    - label = 0 means negative/non-relevant
-    """
-
     if "label" not in df.columns:
         raise ValueError("DataFrame must contain a 'label' column.")
 
@@ -742,8 +775,6 @@ def compute_pruning_metrics(
         )
 
     rows: list[dict[str, Any]] = []
-
-    # Sort ascending: lowest quality first, therefore pruned first.
     order = np.argsort(scores)
 
     for prune_fraction in prune_fractions:
@@ -839,6 +870,8 @@ def main() -> None:
     LOGGER.info("Prune fractions: %s", prune_fractions)
     LOGGER.info("============================================================")
 
+    metadata_cfg = _safe_load_metadata_config(args.metadata_model_path)
+
     tokenizer = AutoTokenizer.from_pretrained(args.text_model_path, use_fast=True)
     true_token_id, false_token_id = get_true_false_token_ids(tokenizer)
 
@@ -846,10 +879,54 @@ def main() -> None:
     lexical_store = LexicalMetadataStore.from_path(args.metadata_path)
     LOGGER.info("Lexical features: %s", lexical_store.feature_names)
 
-    LOGGER.info("Carico metadata scaler...")
-    scaler = MetadataFeatureScaler.load(args.metadata_scaler_path)
-    validate_scaler_features(scaler, lexical_store)
-    LOGGER.info("Scaler caricato e validato.")
+    lexical_scaler_path = _get_cfg_path(
+        args.lexical_scaler_path or args.metadata_scaler_path,
+        metadata_cfg,
+        ["lexical_scaler_path", "metadata_scaler_path"],
+        args.metadata_model_path,
+    )
+
+    embedding_scaler_path = _get_cfg_path(
+        args.embedding_scaler_path,
+        metadata_cfg,
+        ["embedding_feature_scaler_path", "embedding_scaler_path"],
+        args.metadata_model_path,
+    )
+
+    token_scaler_path = _get_cfg_path(
+        args.token_scaler_path,
+        metadata_cfg,
+        ["token_feature_scaler_path", "token_scaler_path"],
+        args.metadata_model_path,
+    )
+
+    if lexical_scaler_path is None:
+        raise ValueError(
+            "Lexical scaler path non trovato. Passa --metadata_scaler_path oppure "
+            "--lexical_scaler_path, oppure assicurati che metadata_qualt5_config.json "
+            "contenga lexical_scaler_path/metadata_scaler_path."
+        )
+
+    if embedding_scaler_path is None:
+        raise ValueError(
+            "Embedding scaler path non trovato. Passa --embedding_scaler_path oppure "
+            "assicurati che metadata_qualt5_config.json contenga embedding_scaler_path."
+        )
+
+    if token_scaler_path is None:
+        raise ValueError(
+            "Token scaler path non trovato. Passa --token_scaler_path oppure "
+            "assicurati che metadata_qualt5_config.json contenga token_scaler_path."
+        )
+
+    LOGGER.info("Lexical scaler path: %s", lexical_scaler_path)
+    LOGGER.info("Embedding scaler path: %s", embedding_scaler_path)
+    LOGGER.info("Token scaler path: %s", token_scaler_path)
+
+    LOGGER.info("Carico lexical scaler...")
+    lexical_scaler = MetadataFeatureScaler.load(lexical_scaler_path)
+    validate_scaler_features(lexical_scaler, lexical_store)
+    LOGGER.info("Lexical scaler caricato e validato.")
 
     df = collect_balanced_examples(
         args=args,
@@ -886,13 +963,16 @@ def main() -> None:
         true_token_id=true_token_id,
         false_token_id=false_token_id,
         lexical_feature_dim=len(lexical_store.feature_names),
+        metadata_cfg=metadata_cfg,
+        embedding_scaler_path=embedding_scaler_path,
+        token_scaler_path=token_scaler_path,
     )
 
     df["score_metadata"] = score_metadata_model(
         model=metadata_model,
         tokenizer=tokenizer,
         lexical_store=lexical_store,
-        scaler=scaler,
+        lexical_scaler=lexical_scaler,
         df=df,
         args=args,
         device=device,
@@ -973,21 +1053,24 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     
+    
 '''
 CUDA_VISIBLE_DEVICES=1 \
 NCCL_P2P_DISABLE=1 \
 NCCL_IB_DISABLE=1 \
 python -u -m metaqual.utils.diagnostic_metadata \
   --text_model_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
-  --metadata_model_path /home/sacco/metaqual/outputs/metadata-qualt5lastdec-lmhead-lr5e5-10k \
+  --metadata_model_path /home/sacco/metaqual/outputs/metadata-qualt5-newarch-nodropout-h256-10k \
   --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
-  --metadata_scaler_path /home/sacco/metaqual/outputs/metadata-qualt5lastdec-lmhead-lr5e5-10k/metadata_scaler.pkl \
-  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5lastdec-lmhead-lr5e5-10k/diagnostic_eval_skip_train \
+  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-newarch-nodropout-h256-10k/diagnostic_eval_skip_train \
   --triples_source irds \
   --irds_dataset_id msmarco-passage/train/triples-small \
   --sample_per_class 10000 \
   --skip_first_raw_examples 160000 \
+  --metadata_dropout 0.0 \
   --metadata_mlp_hidden_dim 256 \
+  --metadata_fusion_mode pooled_concat_projection \
+  --unfreeze_last_n_decoder_blocks 1 \
   --batch_size 16 \
   --max_length 512 \
   --bf16

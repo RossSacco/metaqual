@@ -9,17 +9,23 @@ from pyterrier_quality import QualCache
 
 def get_scorer_name_from_cache(filename, dataset_name):
     """
-    Esempio:
-    finetuned_qualt5_msmarco_passage.cache -> finetuned_qualt5
-    qualt5_msmarco_passage.cache           -> qualt5
-    tasb_msmarco_passage.cache             -> tasb
+    Esempi:
+    finetuned_qualt5_msmarco_passage.cache        -> finetuned_qualt5
+    metadata_qualt5_msmarco_passage_nuovo.cache  -> finetuned_qualt5_nuovo
+    qualt5_msmarco_passage.cache                  -> qualt5
+    tasb_msmarco_passage.cache                    -> tasb
     """
+
+    suffix_nuovo = f"_{dataset_name}_nuovo.cache"
     suffix = f"_{dataset_name}.cache"
+
+    if filename.endswith(suffix_nuovo):
+        base_name = filename[:-len(suffix_nuovo)]
+        return f"{base_name}_nuovo"
 
     if filename.endswith(suffix):
         return filename[:-len(suffix)]
 
-    # fallback, nel caso ci siano cache con nomi diversi
     return filename.replace(".cache", "")
 
 

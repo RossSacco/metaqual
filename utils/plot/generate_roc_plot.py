@@ -12,6 +12,7 @@ def plot_roc(input_file="roc_data.pkl"):
     axins = ax.inset_axes([0.05, 0.7, 0.25, 0.25])
     
     colors = {
+        'metadata_qualt5_nuovo': '#9467bd',
         'finetuned_qualt5': '#1f77b4',
         'metadata_qualt5': '#ff7f0e',
         'itn': '#d62728',
@@ -23,6 +24,7 @@ def plot_roc(input_file="roc_data.pkl"):
     legend_names = {
         'finetuned_qualt5': 'QualT5-Finetuned',
         'metadata_qualt5': 'Metadata-QualT5',
+        'metadata_qualt5_nuovo': 'Metadata-QualT5-Nuovo',
         'perplexity': 'T5-Ppl',
         'tasb': 'TASB-Mag',
         'itn': 'ITN',
@@ -61,7 +63,7 @@ def plot_roc(input_file="roc_data.pkl"):
     
     ax.indicate_inset_zoom(axins, edgecolor="black")
 
-    output_path = "metaqual/utils/plot/roc_metaqual.png"
+    output_path = "metaqual/utils/plot/roc_metaqual2.png"
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Grafico salvato in: {output_path}")
 

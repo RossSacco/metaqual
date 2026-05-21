@@ -34,9 +34,9 @@ scorers:
     max_length: 512
     device: "cuda"
   metadata_qualt5:
-    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-lr5e5-bs16-h256-3k"
+    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-pooledconcat-NoLMH-dec1-lr5e5-h256-10k"
     metadata_path: "/home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet"
-    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-lr5e5-bs16-h256-3k/metadata_scaler.pkl"
+    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-pooledconcat-NoLMH-dec1-lr5e5-h256-10k/metadata_scaler.pkl"
     batch_size: 100
     max_length: 512
     device: "cuda"

@@ -98,7 +98,7 @@ def extract_token_level_metadata(
     mask = attention_mask.to(hidden_states.dtype)
     valid_lengths = mask.sum(dim=1).clamp_min(1.0)
 
-    token_norms = hidden_states.norm(p=2, dim=-1)  # [B, L]
+    token_norms = hidden_states.norm(p=2, dim=-1)
     masked_norms = token_norms * mask
 
     mean_norm = _safe_div(masked_norms.sum(dim=1), valid_lengths, eps=eps)
@@ -138,7 +138,12 @@ def extract_token_level_metadata(
 
 class MetadataFeatureScaler:
     """
-    Lightweight standardization scaler for lexical metadata.
+    Standardization scaler for metadata features.
+
+    Can be used for:
+    - lexical metadata computed offline;
+    - embedding-level metadata computed online from H_text;
+    - token-level metadata computed online from H_text.
     """
 
     def __init__(self, feature_names: Sequence[str], mean: np.ndarray, std: np.ndarray):
@@ -151,19 +156,23 @@ class MetadataFeatureScaler:
     def fit(cls, values: np.ndarray, feature_names: Sequence[str]) -> "MetadataFeatureScaler":
         if values.ndim != 2:
             raise ValueError(f"Expected 2D array for scaler fit, got shape={values.shape}")
+
         mean = values.mean(axis=0)
         std = values.std(axis=0)
         std[std == 0.0] = 1.0
+
         return cls(feature_names=feature_names, mean=mean, std=std)
 
     def transform(self, values: np.ndarray) -> np.ndarray:
         if values.ndim != 2:
             raise ValueError(f"Expected 2D array for scaler transform, got shape={values.shape}")
+
         if values.shape[1] != len(self.feature_names):
             raise ValueError(
                 "Feature dimension mismatch in scaler transform: "
                 f"got {values.shape[1]}, expected {len(self.feature_names)}"
             )
+
         return (values - self.mean) / self.std
 
     def to_dict(self) -> Dict[str, Any]:
@@ -184,16 +193,85 @@ class MetadataFeatureScaler:
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
         with path.open("wb") as handle:
             pickle.dump(self.to_dict(), handle)
 
     @classmethod
     def load(cls, path: str | Path) -> "MetadataFeatureScaler":
         path = Path(path)
+
         with path.open("rb") as handle:
             payload = pickle.load(handle)
-        return cls.from_dict(payload)
 
+        return cls.from_dict(payload)
+    
+class TorchMetadataScaler(nn.Module):
+    """
+    Torch version of MetadataFeatureScaler.
+
+    It stores mean/std as buffers, so they move automatically to CPU/GPU
+    together with the model. This is useful for x_emb and x_tok, which are
+    computed online during forward.
+    """
+
+    def __init__(
+        self,
+        mean: Sequence[float] | np.ndarray | torch.Tensor,
+        std: Sequence[float] | np.ndarray | torch.Tensor,
+        *,
+        feature_names: Optional[Sequence[str]] = None,
+        eps: float = 1e-12,
+    ):
+        super().__init__()
+
+        mean_tensor = torch.as_tensor(mean, dtype=torch.float32)
+        std_tensor = torch.as_tensor(std, dtype=torch.float32).clamp_min(eps)
+
+        if mean_tensor.ndim != 1 or std_tensor.ndim != 1:
+            raise ValueError(
+                "TorchMetadataScaler expects 1D mean/std vectors, "
+                f"got mean={tuple(mean_tensor.shape)}, std={tuple(std_tensor.shape)}"
+            )
+
+        if mean_tensor.shape != std_tensor.shape:
+            raise ValueError(
+                "TorchMetadataScaler mean/std shape mismatch: "
+                f"mean={tuple(mean_tensor.shape)}, std={tuple(std_tensor.shape)}"
+            )
+
+        self.feature_names = list(feature_names) if feature_names is not None else None
+        self.register_buffer("mean", mean_tensor)
+        self.register_buffer("std", std_tensor)
+
+    @classmethod
+    def from_metadata_scaler(cls, scaler: MetadataFeatureScaler) -> "TorchMetadataScaler":
+        return cls(
+            mean=scaler.mean,
+            std=scaler.std,
+            feature_names=scaler.feature_names,
+        )
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> "TorchMetadataScaler":
+        return cls.from_metadata_scaler(MetadataFeatureScaler.load(path))
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        if values.ndim != 2:
+            raise ValueError(
+                f"Expected metadata tensor with shape [B, F], got {tuple(values.shape)}"
+            )
+
+        if values.shape[1] != self.mean.numel():
+            raise ValueError(
+                "Feature dimension mismatch in TorchMetadataScaler: "
+                f"got {values.shape[1]}, expected {self.mean.numel()}"
+            )
+
+        mean = self.mean.to(device=values.device, dtype=values.dtype)
+        std = self.std.to(device=values.device, dtype=values.dtype)
+
+        return (values - mean) / std
 
 class LexicalMetadataStore:
     """
@@ -275,6 +353,14 @@ class LexicalMetadataStore:
 class GroupWiseMetadataEncoder(nn.Module):
     """
     Encodes each metadata group with a dedicated MLP.
+
+    Expected input:
+    - lexical_features:   [B, lexical_dim]
+    - embedding_features: [B, 6]
+    - token_features:     [B, 5]
+
+    Output:
+    - z_meta: [B, 3, d_model]
     """
 
     def __init__(
@@ -284,8 +370,8 @@ class GroupWiseMetadataEncoder(nn.Module):
         token_dim: int,
         d_model: int,
         hidden_dim: Optional[int] = None,
-        dropout: float = 0.1,
-        normalize_inputs: bool = True,
+        dropout: float = 0.0,
+        normalize_inputs: bool = False,
     ):
         super().__init__()
 
@@ -312,12 +398,17 @@ class GroupWiseMetadataEncoder(nn.Module):
         out_dim: int,
         dropout: float,
     ) -> nn.Sequential:
-        return nn.Sequential(
+        layers = [
             nn.Linear(in_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, out_dim),
-        )
+            nn.ReLU(),
+        ]
+
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+
+        layers.append(nn.Linear(hidden_dim, out_dim))
+
+        return nn.Sequential(*layers)
 
     def forward(
         self,
@@ -333,17 +424,21 @@ class GroupWiseMetadataEncoder(nn.Module):
         z_emb = self.embedding_mlp(embedding_features)
         z_tok = self.token_mlp(token_features)
 
-        # Z_meta: [B, G=3, d_model]
         return torch.stack([z_lex, z_emb, z_tok], dim=1)
 
 
 class UniAttention(nn.Module):
     """
-    Uni-attention from metadata tokens (query) to text hidden states (key/value).
+    Uni-attention from metadata tokens to text hidden states.
+
+    Q = metadata tokens
+    K = H_text
+    V = H_text
     """
 
-    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.0):
         super().__init__()
+
         self.attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
@@ -365,8 +460,8 @@ class UniAttention(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
-        return out
 
+        return out
 
 class MetadataEnrichedQualT5(nn.Module):
     """
@@ -374,11 +469,16 @@ class MetadataEnrichedQualT5(nn.Module):
 
     Fusion modes:
     - concat_tokens:
-        Old behaviour. Metadata tokens are concatenated before text tokens.
-    - gated_residual:
-        New behaviour. Metadata tokens are pooled and injected into h_text via:
-        h_fused = h_text + gate(meta_vec) * meta_to_text(meta_vec)
+        z_meta_fused is prepended to h_text and the decoder attends to [metadata tokens ; text tokens].
+
+    - pooled_concat_projection:
+        z_meta_fused is mean-pooled into meta_vec.
+        meta_vec is repeated for each text token.
+        Each token representation becomes [h_text_t ; meta_vec], projected back to d_model,
+        and fused with residual + LayerNorm.
     """
+
+    VALID_FUSION_MODES = {"concat_tokens", "pooled_concat_projection"}
 
     def __init__(
         self,
@@ -389,21 +489,22 @@ class MetadataEnrichedQualT5(nn.Module):
         *,
         scoring_mode: str = "true_logprob",
         metadata_mlp_hidden_dim: Optional[int] = None,
-        metadata_dropout: float = 0.1,
+        metadata_dropout: float = 0.0,
         attention_heads: int = 8,
         use_meta_ffn: bool = True,
-        normalize_metadata_features: bool = True,
-        unfreeze_last_decoder_block: bool = True,
+        normalize_metadata_features: bool = False,
+        unfreeze_last_n_decoder_blocks: int = 1,
         unfreeze_lm_head: bool = True,
-        metadata_fusion_mode: str = "gated_residual",
-        metadata_gate_init_bias: float = -2.0,
+        metadata_fusion_mode: str = "pooled_concat_projection",
+        lexical_feature_scaler_path: Optional[str | Path] = None,
+        embedding_feature_scaler_path: Optional[str | Path] = None,
+        token_feature_scaler_path: Optional[str | Path] = None,
     ):
         super().__init__()
 
-        if metadata_fusion_mode not in {"concat_tokens", "gated_residual"}:
+        if metadata_fusion_mode not in self.VALID_FUSION_MODES:
             raise ValueError(
-                "metadata_fusion_mode must be one of "
-                "{'concat_tokens', 'gated_residual'}, "
+                f"metadata_fusion_mode must be one of {sorted(self.VALID_FUSION_MODES)}, "
                 f"got {metadata_fusion_mode}"
             )
 
@@ -417,10 +518,39 @@ class MetadataEnrichedQualT5(nn.Module):
         self.d_model = int(self.config.d_model)
 
         self.normalize_metadata_features = bool(normalize_metadata_features)
-        self.unfreeze_last_decoder_block_flag = bool(unfreeze_last_decoder_block)
+        self.unfreeze_last_n_decoder_blocks = int(unfreeze_last_n_decoder_blocks)
         self.unfreeze_lm_head_flag = bool(unfreeze_lm_head)
         self.metadata_fusion_mode = metadata_fusion_mode
-        self.metadata_gate_init_bias = float(metadata_gate_init_bias)
+        self.lexical_feature_scaler_path = (
+            str(lexical_feature_scaler_path) if lexical_feature_scaler_path is not None else None
+        )
+        self.embedding_feature_scaler_path = (
+            str(embedding_feature_scaler_path) if embedding_feature_scaler_path is not None else None
+        )
+        self.token_feature_scaler_path = (
+            str(token_feature_scaler_path) if token_feature_scaler_path is not None else None
+        )
+        
+        if lexical_feature_scaler_path is not None:
+            self.lexical_feature_scaler = TorchMetadataScaler.from_path(lexical_feature_scaler_path)
+        else:
+            self.lexical_feature_scaler = nn.Identity()
+
+        if embedding_feature_scaler_path is not None:
+            self.embedding_feature_scaler = TorchMetadataScaler.from_path(embedding_feature_scaler_path)
+        else:
+            self.embedding_feature_scaler = nn.Identity()
+
+        if token_feature_scaler_path is not None:
+            self.token_feature_scaler = TorchMetadataScaler.from_path(token_feature_scaler_path)
+        else:
+            self.token_feature_scaler = nn.Identity()   
+
+        if self.unfreeze_last_n_decoder_blocks < 0:
+            raise ValueError(
+                "unfreeze_last_n_decoder_blocks must be >= 0, "
+                f"got {self.unfreeze_last_n_decoder_blocks}"
+            )
 
         self.group_encoder = GroupWiseMetadataEncoder(
             lexical_dim=lexical_feature_dim,
@@ -438,73 +568,77 @@ class MetadataEnrichedQualT5(nn.Module):
             dropout=metadata_dropout,
         )
 
-        self.meta_dropout = nn.Dropout(metadata_dropout)
         self.meta_ln_1 = nn.LayerNorm(self.d_model)
 
         self.use_meta_ffn = bool(use_meta_ffn)
         if self.use_meta_ffn:
-            self.meta_ffn = nn.Sequential(
+            meta_ffn_layers = [
                 nn.Linear(self.d_model, self.d_model * 4),
-                nn.GELU(),
-                nn.Dropout(metadata_dropout),
-                nn.Linear(self.d_model * 4, self.d_model),
-            )
+                nn.ReLU(),
+            ]
+
+            if metadata_dropout > 0.0:
+                meta_ffn_layers.append(nn.Dropout(metadata_dropout))
+
+            meta_ffn_layers.append(nn.Linear(self.d_model * 4, self.d_model))
+
+            self.meta_ffn = nn.Sequential(*meta_ffn_layers)
             self.meta_ln_2 = nn.LayerNorm(self.d_model)
 
-        # New gated residual fusion modules.
-        # They are used only if metadata_fusion_mode == "gated_residual".
-        self.meta_to_text = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model),
-            nn.GELU(),
-            nn.Dropout(metadata_dropout),
-            nn.Linear(self.d_model, self.d_model),
-        )
+        pooled_projection_layers = [
+            nn.Linear(self.d_model * 2, self.d_model),
+            nn.ReLU(),
+        ]
 
-        self.meta_gate = nn.Linear(self.d_model, self.d_model)
-        self._init_metadata_gate()
+        if metadata_dropout > 0.0:
+            pooled_projection_layers.append(nn.Dropout(metadata_dropout))
+
+        pooled_projection_layers.append(nn.Linear(self.d_model, self.d_model))
+
+        self.pooled_concat_projection = nn.Sequential(*pooled_projection_layers)
+        self.pooled_concat_ln = nn.LayerNorm(self.d_model)
 
         self.freeze_all_base_model_except_decoder_cross_attention(
-            unfreeze_last_decoder_block=self.unfreeze_last_decoder_block_flag,
+            unfreeze_last_n_decoder_blocks=self.unfreeze_last_n_decoder_blocks,
             unfreeze_lm_head=self.unfreeze_lm_head_flag,
         )
-
-    def _init_metadata_gate(self) -> None:
-        """
-        Conservative initialization:
-        - weight = 0
-        - bias = metadata_gate_init_bias
-
-        If bias = -2, sigmoid(-2) ≈ 0.12.
-        This means that the metadata correction starts small.
-        """
-        nn.init.zeros_(self.meta_gate.weight)
-        nn.init.constant_(self.meta_gate.bias, self.metadata_gate_init_bias)
 
     def freeze_all_base_model_except_decoder_cross_attention(
         self,
         *,
-        unfreeze_last_decoder_block: bool = True,
+        unfreeze_last_n_decoder_blocks: int = 1,
         unfreeze_lm_head: bool = True,
     ) -> None:
         """
         Freezes the entire T5 backbone, then unfreezes:
-        1. decoder cross-attention layers;
-        2. optionally, the last decoder block;
+
+        1. decoder cross-attention layers in all decoder blocks;
+        2. optionally, the last N decoder blocks;
         3. optionally, the LM head.
         """
+        unfreeze_last_n_decoder_blocks = int(unfreeze_last_n_decoder_blocks)
+        if unfreeze_last_n_decoder_blocks < 0:
+            raise ValueError(
+                "unfreeze_last_n_decoder_blocks must be >= 0, "
+                f"got {unfreeze_last_n_decoder_blocks}"
+            )
+
         for param in self.base_model.parameters():
             param.requires_grad = False
 
         for name, param in self.base_model.named_parameters():
-            # In T5, decoder.block.*.layer.1 is encoder-decoder attention.
             if "decoder.block" in name and ".layer.1." in name:
                 param.requires_grad = True
 
-        if unfreeze_last_decoder_block:
-            decoder = self.base_model.get_decoder()
-            if hasattr(decoder, "block") and len(decoder.block) > 0:
-                for param in decoder.block[-1].parameters():
-                    param.requires_grad = True
+        decoder = self.base_model.get_decoder()
+        if hasattr(decoder, "block") and len(decoder.block) > 0:
+            n_blocks = len(decoder.block)
+            n_to_unfreeze = min(unfreeze_last_n_decoder_blocks, n_blocks)
+
+            if n_to_unfreeze > 0:
+                for block in decoder.block[-n_to_unfreeze:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
 
         if unfreeze_lm_head and hasattr(self.base_model, "lm_head"):
             for param in self.base_model.lm_head.parameters():
@@ -605,38 +739,42 @@ class MetadataEnrichedQualT5(nn.Module):
                 dtype=attention_mask.dtype,
                 device=attention_mask.device,
             )
+
             fused_attention_mask = torch.cat([meta_mask, attention_mask], dim=1)
 
             debug = {
                 "meta_vec": z_meta_fused.mean(dim=1),
             }
+
             return h_fused, fused_attention_mask, debug
 
-        # New gated residual fusion.
-        # z_meta_fused: [B, 3, d]
-        # meta_vec: [B, d]
-        meta_vec = z_meta_fused.mean(dim=1)
+        if self.metadata_fusion_mode == "pooled_concat_projection":
+            # z_meta_fused: [B, 3, d]
+            meta_vec = z_meta_fused.mean(dim=1)
 
-        # meta_bias: [B, d]
-        meta_bias = self.meta_to_text(meta_vec)
+        # meta_seq: [B, L, d]
+            meta_seq = meta_vec.unsqueeze(1).expand(-1, seq_len, -1)
 
-        # meta_gate: [B, d], values in [0,1]
-        meta_gate = torch.sigmoid(self.meta_gate(meta_vec))
+        # token_meta_pair: [B, L, 2d]
+            token_meta_pair = torch.cat([h_text, meta_seq], dim=-1)
 
-        # h_fused: [B, L, d]
-        h_fused = h_text + meta_gate.unsqueeze(1) * meta_bias.unsqueeze(1)
+        # metadata_update: [B, L, d]
+            metadata_update = self.pooled_concat_projection(token_meta_pair)
 
-        # Sequence length stays the same as original text.
-        fused_attention_mask = attention_mask
+        # Final metadata-aware encoder states.
+        # No gating. No dropout.
+            h_fused = self.pooled_concat_ln(h_text + metadata_update)
 
-        debug = {
-            "meta_vec": meta_vec,
-            "meta_bias": meta_bias,
-            "meta_gate": meta_gate,
-            "meta_gate_mean": meta_gate.mean(dim=-1),
-        }
+            fused_attention_mask = attention_mask
 
-        return h_fused, fused_attention_mask, debug
+            debug = {
+                "meta_vec": meta_vec,
+                "metadata_update": metadata_update,
+                "metadata_update_norm": metadata_update.norm(p=2, dim=-1).mean(dim=1),
+            }
+            return h_fused, fused_attention_mask, debug
+
+        raise ValueError(f"Unsupported metadata_fusion_mode={self.metadata_fusion_mode}")
 
     def forward(
         self,
@@ -655,7 +793,7 @@ class MetadataEnrichedQualT5(nn.Module):
         )
         h_text = encoder_outputs.last_hidden_state
 
-        batch_size, seq_len, hidden_dim = h_text.shape
+        batch_size, _seq_len, hidden_dim = h_text.shape
         if hidden_dim != self.d_model:
             raise ValueError(
                 f"Unexpected hidden dim. got={hidden_dim}, expected={self.d_model}"
@@ -664,7 +802,19 @@ class MetadataEnrichedQualT5(nn.Module):
         emb_features = extract_embedding_level_metadata(h_text, attention_mask)
         tok_features = extract_token_level_metadata(h_text, attention_mask)
 
-        z_meta = self.group_encoder(lexical_features, emb_features, tok_features)
+# Standardization.
+# lexical_features may be already standardized offline, but if a scaler path
+# is provided, it is standardized here as a torch operation.
+        lexical_features = self.lexical_feature_scaler(lexical_features.to(h_text.dtype))
+        emb_features = self.embedding_feature_scaler(emb_features)
+        tok_features = self.token_feature_scaler(tok_features)
+
+        z_meta = self.group_encoder(
+            lexical_features=lexical_features,
+            embedding_features=emb_features,
+            token_features=tok_features,
+        )
+        
         if z_meta.shape != (batch_size, 3, self.d_model):
             raise ValueError(
                 "Invalid Z_meta shape: "
@@ -679,11 +829,11 @@ class MetadataEnrichedQualT5(nn.Module):
             key_padding_mask=key_padding_mask,
         )
 
-        z_meta_fused = self.meta_ln_1(z_meta + self.meta_dropout(z_att))
+        z_meta_fused = self.meta_ln_1(z_meta + z_att)
 
         if self.use_meta_ffn:
             z_meta_fused = self.meta_ln_2(
-                z_meta_fused + self.meta_dropout(self.meta_ffn(z_meta_fused))
+                z_meta_fused + self.meta_ffn(z_meta_fused)
             )
 
         h_fused, fused_attention_mask, fusion_debug = self._apply_metadata_fusion(
@@ -746,12 +896,17 @@ class MetadataEnrichedQualT5(nn.Module):
             "meta_ln_1": self.meta_ln_1.state_dict(),
             "use_meta_ffn": self.use_meta_ffn,
             "normalize_metadata_features": self.normalize_metadata_features,
-            "unfreeze_last_decoder_block": self.unfreeze_last_decoder_block_flag,
+            "unfreeze_last_n_decoder_blocks": self.unfreeze_last_n_decoder_blocks,
             "unfreeze_lm_head": self.unfreeze_lm_head_flag,
             "metadata_fusion_mode": self.metadata_fusion_mode,
-            "metadata_gate_init_bias": self.metadata_gate_init_bias,
-            "meta_to_text": self.meta_to_text.state_dict(),
-            "meta_gate": self.meta_gate.state_dict(),
+            "lexical_feature_scaler_path": self.lexical_feature_scaler_path,
+            "embedding_feature_scaler_path": self.embedding_feature_scaler_path,
+            "token_feature_scaler_path": self.token_feature_scaler_path,
+            "lexical_feature_scaler": self.lexical_feature_scaler.state_dict(),
+            "embedding_feature_scaler": self.embedding_feature_scaler.state_dict(),
+            "token_feature_scaler": self.token_feature_scaler.state_dict(),
+            "pooled_concat_projection": self.pooled_concat_projection.state_dict(),
+            "pooled_concat_ln": self.pooled_concat_ln.state_dict(),
         }
 
         if self.use_meta_ffn:
@@ -774,16 +929,32 @@ class MetadataEnrichedQualT5(nn.Module):
         self.group_encoder.load_state_dict(payload["group_encoder"])
         self.uni_attention.load_state_dict(payload["uni_attention"])
         self.meta_ln_1.load_state_dict(payload["meta_ln_1"])
+        
+        if "lexical_feature_scaler" in payload:
+            self.lexical_feature_scaler.load_state_dict(
+                payload["lexical_feature_scaler"],
+                strict=False,
+            )
 
+        if "embedding_feature_scaler" in payload:
+            self.embedding_feature_scaler.load_state_dict(
+                payload["embedding_feature_scaler"],
+                strict=False,
+            )   
+        if "token_feature_scaler" in payload:
+            self.token_feature_scaler.load_state_dict(
+                payload["token_feature_scaler"],
+                strict=False,
+            )
         if self.use_meta_ffn and "meta_ffn" in payload:
             self.meta_ffn.load_state_dict(payload["meta_ffn"])
             self.meta_ln_2.load_state_dict(payload["meta_ln_2"])
 
-        if "meta_to_text" in payload:
-            self.meta_to_text.load_state_dict(payload["meta_to_text"])
+        if "pooled_concat_projection" in payload:
+            self.pooled_concat_projection.load_state_dict(payload["pooled_concat_projection"])
 
-        if "meta_gate" in payload:
-            self.meta_gate.load_state_dict(payload["meta_gate"])
+        if "pooled_concat_ln" in payload:
+            self.pooled_concat_ln.load_state_dict(payload["pooled_concat_ln"])
 
 
 class RunningMoments:
@@ -830,3 +1001,71 @@ def load_metadata_qualt5_config(model_dir: str | Path) -> Dict[str, Any]:
         return {}
     with config_path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+    
+@torch.no_grad()
+def fit_online_metadata_scalers(
+    model_name_or_path: str,
+    dataloader: Any,
+    *,
+    device: str | torch.device = "cuda",
+    input_ids_key: str = "input_ids",
+    attention_mask_key: str = "attention_mask",
+    max_batches: Optional[int] = None,
+) -> tuple[MetadataFeatureScaler, MetadataFeatureScaler]:
+    """
+    Fit StandardScaler statistics for x_emb and x_tok computed online from H_text.
+
+    The dataloader must yield dictionaries containing:
+    - input_ids
+    - attention_mask
+
+    This function:
+    1. loads the T5/QualT5 encoder;
+    2. computes H_text;
+    3. extracts x_emb and x_tok;
+    4. estimates mean/std in streaming mode;
+    5. returns two MetadataFeatureScaler objects.
+
+    Save them with:
+
+        emb_scaler.save("embedding_scaler.pkl")
+        tok_scaler.save("token_scaler.pkl")
+
+    Then pass their paths to MetadataEnrichedQualT5:
+
+        embedding_feature_scaler_path="embedding_scaler.pkl"
+        token_feature_scaler_path="token_scaler.pkl"
+    """
+    base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name_or_path).to(device)
+    base_model.eval()
+
+    encoder = base_model.get_encoder()
+
+    emb_moments = RunningMoments(len(EMBEDDING_FEATURE_NAMES))
+    tok_moments = RunningMoments(len(TOKEN_FEATURE_NAMES))
+
+    for batch_idx, batch in enumerate(dataloader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+
+        input_ids = batch[input_ids_key].to(device)
+        attention_mask = batch[attention_mask_key].to(device)
+
+        encoder_outputs = encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+        )
+
+        h_text = encoder_outputs.last_hidden_state
+
+        emb_features = extract_embedding_level_metadata(h_text, attention_mask)
+        tok_features = extract_token_level_metadata(h_text, attention_mask)
+
+        emb_moments.update(emb_features.detach().cpu().float().numpy())
+        tok_moments.update(tok_features.detach().cpu().float().numpy())
+
+    emb_scaler = emb_moments.finalize(EMBEDDING_FEATURE_NAMES)
+    tok_scaler = tok_moments.finalize(TOKEN_FEATURE_NAMES)
+
+    return emb_scaler, tok_scaler
