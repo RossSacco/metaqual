@@ -1,8 +1,9 @@
 import os
 import sys
 import re
+import time
 import argparse
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import yaml
 import torch
@@ -17,7 +18,14 @@ from metaqual.data.loaders.msmarco.dataset_loader import DatasetLoader
 from metaqual.retrieval.pyterrier_pipe import RetrievalPipelines
 
 
-DEFAULT_SCORERS = ["tasb", "perplexity", "itn", "cdd", "finetuned_qualt5", "metadata_qualt5"]
+DEFAULT_SCORERS = [
+    "tasb",
+    "perplexity",
+    "itn",
+    "cdd",
+    "finetuned_qualt5",
+    "metadata_qualt5",
+]
 SUPPORTED_SCORERS = DEFAULT_SCORERS
 
 
@@ -27,13 +35,46 @@ SUPPORTED_SCORERS = DEFAULT_SCORERS
 
 def get_qrels_name(config: Dict[str, Any]) -> str:
     """
-    Se qrels_variant è una lista (es. per DL 19+20), la unisce con un underscore.
-    Altrimenti la converte semplicemente in stringa.
+    Se qrels_variant è una lista, per esempio ["test-2019", "test-2020"],
+    la converte in "test-2019_test-2020".
     """
     variant = config["dataset"]["qrels_variant"]
     if isinstance(variant, list):
-        return "_".join(variant)
+        return "_".join(str(v) for v in variant)
     return str(variant)
+
+
+def get_index_scorer_name(config: Dict[str, Any], scorer_name: str) -> str:
+    """
+    Nome fisico dello scorer usato per cercare la cartella degli indici pruned.
+
+    Esempio:
+        scorer_name = "metadata_qualt5"
+        experiment.index_scorer_name = "metadata_qualt5_MP"
+
+    Allora lo script userà:
+        /data/data-sacco/indexes/metadata_qualt5_MP_pruned_0.15
+
+    ma nei risultati continuerà a salvare lo scorer logico:
+        metadata_qualt5
+    """
+    exp_cfg = config.get("experiment", {})
+
+    # Caso semplice: un solo scorer attivo.
+    if "index_scorer_name" in exp_cfg:
+        return str(exp_cfg["index_scorer_name"])
+
+    # Caso avanzato: scorer="all" con mapping.
+    # Esempio:
+    # index_scorer_names:
+    #   metadata_qualt5: metadata_qualt5_MP
+    #   finetuned_qualt5: finetuned_qualt5
+    mapping = exp_cfg.get("index_scorer_names", {})
+    if isinstance(mapping, dict) and scorer_name in mapping:
+        return str(mapping[scorer_name])
+
+    return scorer_name
+
 
 def ensure_pyterrier_started() -> None:
     print("[DEBUG] Inizializzazione di PyTerrier/Java...")
@@ -151,24 +192,34 @@ def get_full_runs_dir(config: Dict[str, Any]) -> str:
     dataset_name = config["dataset"]["name"]
     active_retriever = config["experiment"].get("retriever", "all").lower()
     base_runs_dir = get_base_runs_dir(config)
+
     full_runs_dir = config["paths"].get(
         "full_runs_dir",
         os.path.join(base_runs_dir, f"runs_full_{dataset_name}_{active_retriever}")
     )
+
     os.makedirs(full_runs_dir, exist_ok=True)
     return full_runs_dir
 
 
 def get_pruned_runs_dir(config: Dict[str, Any], scorer_name: str) -> str:
+    """
+    Directory per salvare/riusare le run pruned.
+
+    Nota:
+    - scorer_name è il nome logico dello scorer, per esempio metadata_qualt5.
+    - index_scorer_name serve solo per trovare la cartella fisica dell'indice.
+    """
     active_retriever = config["experiment"].get("retriever", "all").lower()
     threshold = config["experiment"]["threshold"]
-    qrels_name = get_qrels_name(config) # <--- Modifica qui
+    qrels_name = get_qrels_name(config)
     base_runs_dir = get_base_runs_dir(config)
 
-    # Include il nome dei qrels per evitare collisioni tra run fatte con set di qrels diversi.
     pruned_runs_dir = os.path.join(
-        base_runs_dir, f"runs_{active_retriever}_{scorer_name}_{qrels_name}_{threshold}"
+        base_runs_dir,
+        f"runs_{active_retriever}_{scorer_name}_{qrels_name}_{threshold}"
     )
+
     os.makedirs(pruned_runs_dir, exist_ok=True)
     return pruned_runs_dir
 
@@ -182,42 +233,35 @@ def prepare_topics_and_qrels(config: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.D
     topics_variants = config["dataset"]["topics_variant"]
     qrels_variants = config["dataset"]["qrels_variant"]
 
-    # Rende il codice retrocompatibile se nel config passi una stringa singola
     if isinstance(topics_variants, str):
         topics_variants = [topics_variants]
     if isinstance(qrels_variants, str):
         qrels_variants = [qrels_variants]
 
-    print(f"\n[DEBUG] Caricamento dataset ({dataset_name}) per varianti: {topics_variants}...")
+    print(f"\n[DEBUG] Caricamento dataset ({dataset_name}) per varianti topics: {topics_variants}")
+    print(f"[DEBUG] Caricamento qrels per varianti: {qrels_variants}")
+
     loader = DatasetLoader(dataset_name)
 
     topics_list = []
     qrels_list = []
 
-    # Carica e accumula i topics
     for tv in topics_variants:
         topics_list.append(loader.get_topics(tv).copy())
-        
-    # Carica e accumula le qrels
+
     for qv in qrels_variants:
         qrels_list.append(loader.get_qrels(qv).copy())
 
-    # Concatena le liste di DataFrame in un unico DataFrame
     topics = pd.concat(topics_list, ignore_index=True)
     qrels = pd.concat(qrels_list, ignore_index=True)
 
-    # Rimuovi eventuali duplicati di sicurezza
     topics = topics.drop_duplicates(subset=["qid"])
-    
-    # Assicurati che non ci siano duplicati sulla coppia query-documento nelle qrels
+
     if "docno" in qrels.columns:
         qrels = qrels.drop_duplicates(subset=["qid", "docno"])
 
-    # Applica il filtro: mantieni solo le query che hanno giudizi nelle qrels
     topics = topics[topics["qid"].isin(qrels["qid"])].copy()
     topics["query"] = topics["query"].apply(clean_query_for_terrier)
-    
-    # Rimuovi eventuali query rimaste vuote dopo la pulizia
     topics = topics[topics["query"].astype(str).str.len() > 0].copy()
 
     print(f"[DEBUG] Totale query unificate: {len(topics)}")
@@ -275,7 +319,9 @@ def build_full_systems(config: Dict[str, Any]) -> Tuple[List[Any], List[str]]:
         tasb_model = move_model_to_cuda(tasb_model, "TAS-B Full")
 
         print("[DEBUG] Caricamento FlexIndex per TAS-B FULL da HuggingFace...")
-        full_tasb_index = pyterrier_dr.FlexIndex.from_hf("macavaney/msmarco-passage.tasb.flex")
+        full_tasb_index = pyterrier_dr.FlexIndex.from_hf(
+            "macavaney/msmarco-passage.tasb.flex"
+        )
 
         tasb_encoder_gpu = tasb_model.query_encoder(batch_size=64, verbose=True)
         pipe_tasb_full = tasb_encoder_gpu >> full_tasb_index
@@ -301,8 +347,25 @@ def build_pruned_systems(
     active_retriever = config["experiment"].get("retriever", "all").lower()
     indexes_dir = config["paths"]["indexes_dir"]
 
-    pruned_root = os.path.join(indexes_dir, f"{scorer_name}_pruned_{threshold}")
-    ensure_path_exists(pruned_root, f"Cartella root degli indici pruned per scorer={scorer_name}")
+    index_scorer_name = get_index_scorer_name(config, scorer_name)
+
+    pruned_root = os.path.join(
+        indexes_dir,
+        f"{index_scorer_name}_pruned_{threshold}"
+    )
+
+    ensure_path_exists(
+        pruned_root,
+        (
+            f"Cartella root degli indici pruned per scorer logico={scorer_name}, "
+            f"index_scorer_name={index_scorer_name}"
+        )
+    )
+
+    print("\n[DEBUG] Indice pruned selezionato:")
+    print(f"  - scorer logico: {scorer_name}")
+    print(f"  - index_scorer_name fisico: {index_scorer_name}")
+    print(f"  - pruned_root: {pruned_root}")
 
     systems = []
     names = []
@@ -345,22 +408,78 @@ def build_pruned_systems(
         tasb_pruned_path = os.path.join(pruned_root, "tasb.flex")
         ensure_path_exists(tasb_pruned_path, "Indice TAS-B pruned")
 
-        pipe_tasb_p = RetrievalPipelines(tasb_pruned_path, query_encoder=tasb_model).get_tasb()
+        pipe_tasb_p = RetrievalPipelines(
+            tasb_pruned_path,
+            query_encoder=tasb_model
+        ).get_tasb()
 
         systems.append(pipe_tasb_p)
         names.append("TAS-B Pruned")
 
     if not systems:
         raise ValueError(
-            f"Nessun sistema PRUNED caricato. Verifica retriever={active_retriever} e scorer={scorer_name}."
+            f"Nessun sistema PRUNED caricato. "
+            f"Verifica retriever={active_retriever}, scorer={scorer_name}, pruned_root={pruned_root}."
         )
 
     return systems, names, pruned_root
 
 
 # =========================================================
-# EXPERIMENT
+# EXPERIMENT + TIMINGS
 # =========================================================
+
+def _add_timing_columns_to_avg(
+    avg_df: pd.DataFrame,
+    system_name: str,
+    elapsed_seconds: float,
+    num_queries: int,
+) -> pd.DataFrame:
+    """
+    Aggiunge le metriche temporali al DataFrame medio prodotto da pt.Experiment.
+    """
+    df = avg_df.copy()
+
+    if "name" not in df.columns:
+        df["name"] = system_name
+
+    df["runtime_seconds"] = elapsed_seconds
+
+    if num_queries > 0:
+        df["ms_per_query"] = (elapsed_seconds * 1000.0) / num_queries
+        df["queries_per_second"] = num_queries / elapsed_seconds if elapsed_seconds > 0 else float("inf")
+    else:
+        df["ms_per_query"] = None
+        df["queries_per_second"] = None
+
+    return df
+
+
+def _make_timing_row(
+    system_name: str,
+    save_dir: str,
+    elapsed_seconds: float,
+    num_queries: int,
+) -> Dict[str, Any]:
+    """
+    Riga compatta per il CSV separato dei tempi.
+    """
+    if num_queries > 0:
+        ms_per_query = (elapsed_seconds * 1000.0) / num_queries
+        qps = num_queries / elapsed_seconds if elapsed_seconds > 0 else float("inf")
+    else:
+        ms_per_query = None
+        qps = None
+
+    return {
+        "name": system_name,
+        "save_dir": save_dir,
+        "num_queries": num_queries,
+        "runtime_seconds": elapsed_seconds,
+        "ms_per_query": ms_per_query,
+        "queries_per_second": qps,
+    }
+
 
 def run_cached_experiment(
     systems: List[Any],
@@ -368,33 +487,93 @@ def run_cached_experiment(
     topics: pd.DataFrame,
     qrels: pd.DataFrame,
     save_dir: str,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Esegue pt.Experiment sistema per sistema per poter misurare i tempi separatamente.
+
+    Restituisce:
+    - res_avg: metriche medie + colonne di tempo
+    - res_perq: metriche per-query
+    - timings_df: solo tempi, comodo per analisi separate
+
+    Nota importante:
+    save_mode="reuse" rimane attivo. Quindi il tempo misurato può essere:
+    - tempo reale di retrieval/evaluation, se la run non esisteva;
+    - tempo di riuso/lettura/evaluation, se la run era già salvata.
+    """
     print("\n========================================================")
     print(f"[INFO] Avvio / riuso metriche per i sistemi: {', '.join(names)}")
     print(f"[INFO] save_dir: {save_dir}")
     print("========================================================\n")
 
-    res_avg, res_perq = pt.Experiment(
-        systems,
-        topics,
-        qrels,
-        eval_metrics=get_eval_metrics(),
-        names=names,
-        verbose=True,
-        save_dir=save_dir,
-        save_mode="reuse",
-        perquery="both",
-    )
-    return res_avg, res_perq
+    os.makedirs(save_dir, exist_ok=True)
+
+    all_avg = []
+    all_perq = []
+    timing_rows = []
+
+    num_queries = len(topics)
+
+    for system, name in zip(systems, names):
+        print("\n" + "-" * 80)
+        print(f"[INFO] Avvio sistema: {name}")
+        print("-" * 80)
+
+        start = time.perf_counter()
+
+        avg_df, perq_df = pt.Experiment(
+            [system],
+            topics,
+            qrels,
+            eval_metrics=get_eval_metrics(),
+            names=[name],
+            verbose=True,
+            save_dir=save_dir,
+            save_mode="reuse",
+            perquery="both",
+        )
+
+        elapsed = time.perf_counter() - start
+
+        print(f"[TIME] {name}: {elapsed:.3f} secondi")
+        if num_queries > 0:
+            print(f"[TIME] {name}: {(elapsed * 1000.0) / num_queries:.3f} ms/query")
+            print(f"[TIME] {name}: {num_queries / elapsed:.3f} query/s")
+
+        avg_df = _add_timing_columns_to_avg(
+            avg_df=avg_df,
+            system_name=name,
+            elapsed_seconds=elapsed,
+            num_queries=num_queries,
+        )
+
+        timing_rows.append(
+            _make_timing_row(
+                system_name=name,
+                save_dir=save_dir,
+                elapsed_seconds=elapsed,
+                num_queries=num_queries,
+            )
+        )
+
+        all_avg.append(avg_df)
+        all_perq.append(perq_df)
+
+    res_avg = pd.concat(all_avg, ignore_index=True) if all_avg else pd.DataFrame()
+    res_perq = pd.concat(all_perq, ignore_index=True) if all_perq else pd.DataFrame()
+    timings_df = pd.DataFrame(timing_rows)
+
+    return res_avg, res_perq, timings_df
 
 
 def get_or_compute_full_results(
     config: Dict[str, Any],
     topics: pd.DataFrame,
     qrels: pd.DataFrame,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     full_runs_dir = get_full_runs_dir(config)
     full_systems, full_names = build_full_systems(config)
+
     return run_cached_experiment(
         systems=full_systems,
         names=full_names,
@@ -409,9 +588,10 @@ def compute_pruned_results(
     scorer_name: str,
     topics: pd.DataFrame,
     qrels: pd.DataFrame,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     pruned_runs_dir = get_pruned_runs_dir(config, scorer_name)
     pruned_systems, pruned_names, _ = build_pruned_systems(config, scorer_name)
+
     return run_cached_experiment(
         systems=pruned_systems,
         names=pruned_names,
@@ -422,12 +602,13 @@ def compute_pruned_results(
 
 
 # =========================================================
-# SAVE PER-QUERY
+# SAVE OUTPUTS
 # =========================================================
 
 def save_pairwise_perquery_outputs(
     res_avg: pd.DataFrame,
     res_perq: pd.DataFrame,
+    timings_df: pd.DataFrame,
     scorer_name: str,
     threshold: Any,
     active_retriever: str,
@@ -436,22 +617,29 @@ def save_pairwise_perquery_outputs(
 ) -> None:
     """
     Salva:
-    1. CSV medio complessivo
+    1. CSV medio complessivo, con metriche IR + tempi
     2. CSV per-query lungo
-    3. CSV per-query pivotato: una riga per qid, colonne separate per sistema e metrica
-    4. CSV differenze Full - Pruned per query, utile per test statistici
+    3. CSV per-query pivotato
+    4. CSV differenze Full - Pruned per query
+    5. CSV solo tempi
     """
+    os.makedirs(results_dir, exist_ok=True)
+
     prefix = f"{active_retriever}_{scorer_name}_{qrels_variant}_{threshold}"
 
     avg_path = os.path.join(results_dir, f"compare_{prefix}.csv")
     perq_long_path = os.path.join(results_dir, f"compare_{prefix}_perquery_long.csv")
     perq_wide_path = os.path.join(results_dir, f"compare_{prefix}_perquery_wide.csv")
     perq_diff_path = os.path.join(results_dir, f"compare_{prefix}_perquery_diffs.csv")
+    timings_path = os.path.join(results_dir, f"compare_{prefix}_timings.csv")
 
-    # 1. risultati medi
+    # 1. risultati medi + tempi
     res_avg.to_csv(avg_path, index=False)
 
-    # 2. risultati per-query in formato lungo
+    # 2. timing separati
+    timings_df.to_csv(timings_path, index=False)
+
+    # 3. risultati per-query lunghi
     res_perq.to_csv(perq_long_path, index=False)
 
     df = res_perq.copy()
@@ -464,21 +652,27 @@ def save_pairwise_perquery_outputs(
             f"Colonne disponibili: {list(df.columns)}"
         )
 
-    # 3. pivotato: una riga per qid, colonne tipo "BM25 Full__RR@10"
+    # 4. pivotato: una riga per qid, colonne tipo "BM25 Full__RR@10"
     df_wide = df.pivot_table(
         index="qid",
         columns=["name", "measure"],
         values="value"
     )
-    df_wide.columns = [f"{sys_name}__{metric}" for sys_name, metric in df_wide.columns]
+
+    df_wide.columns = [
+        f"{sys_name}__{metric}"
+        for sys_name, metric in df_wide.columns
+    ]
+
     df_wide = df_wide.reset_index()
     df_wide.to_csv(perq_wide_path, index=False)
 
-    # 4. differenze Full - Pruned per query
+    # 5. differenze Full - Pruned per query
     diff_rows = []
     systems = sorted(df["name"].unique())
 
-    families = {}
+    families: Dict[str, Dict[str, str]] = {}
+
     for sys_name in systems:
         if sys_name.endswith(" Full"):
             fam = sys_name[:-5]
@@ -502,6 +696,7 @@ def save_pairwise_perquery_outputs(
             on=["qid", "measure"],
             suffixes=("_full", "_pruned")
         )
+
         merged["system_family"] = fam
         merged["full_name"] = full_name
         merged["pruned_name"] = pruned_name
@@ -534,6 +729,7 @@ def save_pairwise_perquery_outputs(
     print(f"[INFO] ✅ Salvato: {perq_long_path}")
     print(f"[INFO] ✅ Salvato: {perq_wide_path}")
     print(f"[INFO] ✅ Salvato: {perq_diff_path}")
+    print(f"[INFO] ✅ Salvato: {timings_path}")
 
 
 # =========================================================
@@ -548,48 +744,76 @@ def run_single_scorer_evaluation(
 ) -> None:
     threshold = config["experiment"]["threshold"]
     active_retriever = config["experiment"].get("retriever", "all").lower()
-    qrels_name = get_qrels_name(config)  # <--- Modifica qui
+    qrels_name = get_qrels_name(config)
 
     indexes_dir = config["paths"]["indexes_dir"]
     results_dir = config["paths"]["results_dir"]
 
+    index_scorer_name = get_index_scorer_name(config, scorer_name)
+
     ensure_path_exists(indexes_dir, "Cartella indexes_dir")
     os.makedirs(results_dir, exist_ok=True)
 
-    print(f"[DEBUG] Configurazione:")
-    print(f"  - Scorer: {scorer_name} (Threshold: {threshold})")
-    print(f"  - Retriever Attivo: {active_retriever.upper()}")
+    print("\n[DEBUG] Configurazione:")
+    print(f"  - Scorer logico: {scorer_name}")
+    print(f"  - Index scorer fisico: {index_scorer_name}")
+    print(f"  - Threshold: {threshold}")
+    print(f"  - Retriever attivo: {active_retriever.upper()}")
     print(f"  - Full runs dir: {get_full_runs_dir(config)}")
     print(f"  - Pruned runs dir: {get_pruned_runs_dir(config, scorer_name)}")
+    print(
+        "  - Pruned index root attesa: "
+        f"{os.path.join(indexes_dir, f'{index_scorer_name}_pruned_{threshold}')}"
+    )
 
-    # FULL: riuso da cartella stabile
-    full_avg, full_perq = get_or_compute_full_results(config, topics, qrels)
+    # FULL: calcolo o riuso da cartella stabile
+    full_avg, full_perq, full_timings = get_or_compute_full_results(
+        config,
+        topics,
+        qrels
+    )
 
-    # PRUNED: calcolo/riuso solo per scorer+threshold corrente
-    pruned_avg, pruned_perq = compute_pruned_results(config, scorer_name, topics, qrels)
+    # PRUNED: calcolo o riuso per scorer + threshold corrente
+    pruned_avg, pruned_perq, pruned_timings = compute_pruned_results(
+        config,
+        scorer_name,
+        topics,
+        qrels
+    )
 
     # Merge risultati
     res_avg = pd.concat([full_avg, pruned_avg], ignore_index=True)
     res_perq = pd.concat([full_perq, pruned_perq], ignore_index=True)
+    timings_df = pd.concat([full_timings, pruned_timings], ignore_index=True)
 
     # Ordinamento opzionale per leggibilità
     if "name" in res_avg.columns:
         res_avg = res_avg.sort_values(by=["name"]).reset_index(drop=True)
+
     if {"name", "qid", "measure"}.issubset(res_perq.columns):
-        res_perq = res_perq.sort_values(by=["name", "qid", "measure"]).reset_index(drop=True)
+        res_perq = res_perq.sort_values(
+            by=["name", "qid", "measure"]
+        ).reset_index(drop=True)
+
+    if "name" in timings_df.columns:
+        timings_df = timings_df.sort_values(by=["name"]).reset_index(drop=True)
 
     save_pairwise_perquery_outputs(
         res_avg=res_avg,
         res_perq=res_perq,
+        timings_df=timings_df,
         scorer_name=scorer_name,
         threshold=threshold,
         active_retriever=active_retriever,
-        qrels_variant=qrels_name,  # <--- Usa il nome pulito qui
+        qrels_variant=qrels_name,
         results_dir=results_dir,
     )
 
-    print("\n--- Risultati medi ---")
+    print("\n--- Risultati medi + tempi ---")
     print(res_avg.head())
+
+    print("\n--- Timings ---")
+    print(timings_df)
 
     print("\n--- Risultati per-query ---")
     print(res_perq.head())
@@ -618,7 +842,7 @@ def run_evaluation(config: Dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Valutazione full vs pruned con cache separata dei full."
+        description="Valutazione full vs pruned con cache separata dei full e timing."
     )
     parser.add_argument(
         "--config",
@@ -626,6 +850,7 @@ def main() -> None:
         default="config.yaml",
         help="Path del file YAML di configurazione"
     )
+
     args = parser.parse_args()
 
     print(f"[DEBUG] Avvio script con config: {args.config}")

@@ -38,6 +38,14 @@ except ImportError:
 LOGGER = logging.getLogger("evaluate_metadata_qualt5_diagnostic")
 
 
+VALID_NEW_FUSION_MODES = {
+    "concat_tokens",
+    "pooled_concat_projection",
+    "direct_concat_projection",
+    "meta_prefix",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -79,7 +87,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--bf16", action="store_true")
 
-    # New architecture defaults.
     parser.add_argument("--metadata_dropout", type=float, default=0.0)
     parser.add_argument("--metadata_mlp_hidden_dim", type=int, default=None)
     parser.add_argument("--attention_heads", type=int, default=8)
@@ -153,11 +160,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metadata_fusion_mode",
         type=str,
-        choices=["concat_tokens", "pooled_concat_projection"],
+        choices=[
+            "concat_tokens",
+            "pooled_concat_projection",
+            "direct_concat_projection",
+            "meta_prefix",
+        ],
         default="pooled_concat_projection",
         help=(
-            "New architecture default: pooled_concat_projection. "
-            "It computes meta_vec = mean(Z_meta_fused), then H_fused = LayerNorm(H_text + MLP([H_text; meta_vec]))."
+            "Metadata fusion mode. "
+            "'concat_tokens': decoder attends to [z_lex ; z_emb ; z_tok ; H_text]. "
+            "'pooled_concat_projection': H_fused = LayerNorm(H_text + Linear([H_text ; meta_vec])). "
+            "'direct_concat_projection': H_fused = LayerNorm(Linear([H_text ; meta_vec])). "
+            "'meta_prefix': decoder attends to [meta_vec ; H_text]. "
+            "If metadata_qualt5_config.json exists, its value is preferred."
         ),
     )
 
@@ -194,6 +210,7 @@ def parse_prune_fractions(value: str) -> list[float]:
 def resolve_device(args: argparse.Namespace) -> torch.device:
     if args.device is not None:
         return torch.device(args.device)
+
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -213,6 +230,7 @@ def get_true_false_token_ids(tokenizer) -> tuple[int, int]:
 def _safe_load_metadata_config(model_path: str | Path) -> Dict[str, Any]:
     try:
         cfg = load_metadata_qualt5_config(model_path)
+
         if cfg:
             LOGGER.info("metadata_qualt5_config.json caricato da %s", model_path)
             LOGGER.info("Metadata config: %s", cfg)
@@ -221,7 +239,9 @@ def _safe_load_metadata_config(model_path: str | Path) -> Dict[str, Any]:
                 "metadata_qualt5_config.json non trovato o vuoto in %s. Uso valori CLI.",
                 model_path,
             )
+
         return cfg or {}
+
     except Exception as exc:
         LOGGER.warning(
             "Impossibile caricare metadata_qualt5_config.json da %s: %s. Uso valori CLI.",
@@ -530,11 +550,11 @@ def load_metadata_model(
         args.metadata_fusion_mode,
     )
 
-    if metadata_fusion_mode == "gated_residual":
+    if metadata_fusion_mode not in VALID_NEW_FUSION_MODES:
         raise ValueError(
-            "Il checkpoint/config indica metadata_fusion_mode='gated_residual', "
-            "ma la nuova architettura usa 'pooled_concat_projection'. "
-            "Assicurati di valutare un checkpoint addestrato con la nuova architettura."
+            f"Il checkpoint/config indica metadata_fusion_mode={metadata_fusion_mode!r}, "
+            f"ma questo script supporta solo {sorted(VALID_NEW_FUSION_MODES)}. "
+            "Assicurati di valutare un checkpoint addestrato con una delle nuove architetture."
         )
 
     LOGGER.info(
@@ -1053,25 +1073,25 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     
-    
 '''
 CUDA_VISIBLE_DEVICES=1 \
 NCCL_P2P_DISABLE=1 \
 NCCL_IB_DISABLE=1 \
 python -u -m metaqual.utils.diagnostic_metadata \
   --text_model_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
-  --metadata_model_path /home/sacco/metaqual/outputs/metadata-qualt5-newarch-nodropout-h256-10k \
+  --metadata_model_path /home/sacco/metaqual/outputs/metadata-qualt5-concat-dec1-lm-h256-lr5e5-3k \
   --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
-  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-newarch-nodropout-h256-10k/diagnostic_eval_skip_train \
+  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-concat-dec1-lm-h256-lr5e5-3k/diagnostic_eval_skip_train \
   --triples_source irds \
   --irds_dataset_id msmarco-passage/train/triples-small \
   --sample_per_class 10000 \
   --skip_first_raw_examples 160000 \
   --metadata_dropout 0.0 \
   --metadata_mlp_hidden_dim 256 \
-  --metadata_fusion_mode pooled_concat_projection \
-  --unfreeze_last_n_decoder_blocks 1 \
+  --metadata_fusion_mode concat_tokens  \
+  --unfreeze_last_n_decoder_blocks 0 \
   --batch_size 16 \
   --max_length 512 \
   --bf16
+
 '''

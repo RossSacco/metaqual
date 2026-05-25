@@ -419,76 +419,147 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
       - quality
     """
 
+    VALID_FUSION_MODES = {
+        "concat_tokens",
+        "pooled_concat_projection",
+        "direct_concat_projection",
+        "meta_prefix",
+    }
+
     def __init__(
         self,
         model_name_or_path,
         *,
         metadata_path,
         metadata_scaler_path=None,
+        lexical_scaler_path=None,
+        embedding_scaler_path=None,
+        token_scaler_path=None,
         lexical_feature_names=None,
         batch_size=100,
         max_length=512,
         prompt="Document: {} Relevant:",
         device=None,
-        scoring_mode="true_logprob",
+        scoring_mode=None,
         allow_missing_metadata=False,
-        metadata_dropout=0.1,
+        metadata_dropout=None,
         metadata_mlp_hidden_dim=None,
-        attention_heads=8,
-        use_meta_ffn=True,
+        attention_heads=None,
+        use_meta_ffn=None,
+        metadata_fusion_mode=None,
+        normalize_metadata_features=None,
+        unfreeze_last_n_decoder_blocks=None,
+        unfreeze_lm_head=None,
         verbose=False,
     ):
         if not model_name_or_path:
             raise ValueError(
                 "Per 'metadata_qualt5' devi specificare 'model_name_or_path'."
             )
+
         if not metadata_path:
             raise ValueError(
                 "Per 'metadata_qualt5' devi specificare 'metadata_path'."
             )
 
-        self.model_name_or_path = model_name_or_path
-        self.metadata_path = metadata_path
+        self.model_name_or_path = str(model_name_or_path)
+        self.metadata_path = str(metadata_path)
         self.batch_size = int(batch_size)
         self.max_length = int(max_length)
         self.prompt = prompt
-        self.verbose = verbose
+        self.verbose = bool(verbose)
         self.allow_missing_metadata = bool(allow_missing_metadata)
         self.device = self._resolve_device(device)
 
-        saved_meta_cfg = load_metadata_qualt5_config(self.model_name_or_path)
+        self.model_dir = Path(self.model_name_or_path)
+        self.saved_meta_cfg = load_metadata_qualt5_config(self.model_name_or_path)
 
+        if self.saved_meta_cfg:
+            print(f"[MetadataEnrichedQualT5Scorer] Loaded metadata config from {self.model_name_or_path}")
+            print(f"[MetadataEnrichedQualT5Scorer] metadata_qualt5_config: {self.saved_meta_cfg}")
+        else:
+            print(
+                f"[MetadataEnrichedQualT5Scorer][WARNING] "
+                f"metadata_qualt5_config.json not found in {self.model_name_or_path}. "
+                f"Falling back to YAML/constructor values."
+            )
+
+        # ------------------------------------------------------------
+        # Resolve lexical feature names.
+        # ------------------------------------------------------------
         if lexical_feature_names is None:
-            lexical_feature_names = saved_meta_cfg.get("lexical_feature_names")
+            lexical_feature_names = self.saved_meta_cfg.get("lexical_feature_names")
 
         self.lexical_store = LexicalMetadataStore.from_path(
             self.metadata_path,
             feature_names=lexical_feature_names,
         )
 
-        scaler_candidate = metadata_scaler_path
-        if scaler_candidate is None:
-            scaler_candidate = saved_meta_cfg.get("metadata_scaler_path")
-        if scaler_candidate is not None:
-            scaler_candidate = str(scaler_candidate)
-            if not Path(scaler_candidate).is_absolute():
-                scaler_candidate = str(Path(self.model_name_or_path) / scaler_candidate)
-        if scaler_candidate is None:
-            scaler_candidate = str(
-                Path(self.model_name_or_path) / "metadata_scaler.pkl"
-            )
-        if scaler_candidate is None:
-            raise ValueError(
-                "metadata_scaler_path non specificato e non trovato nel config del modello."
-            )
+        # ------------------------------------------------------------
+        # Resolve scaler paths.
+        # Lexical scaler is applied outside the model, before passing lexical_features.
+        # Embedding/token scalers are passed to the model because x_emb and x_tok
+        # are computed online inside forward().
+        # ------------------------------------------------------------
+        self.lexical_scaler_path = self._resolve_config_path(
+            explicit_path=lexical_scaler_path or metadata_scaler_path,
+            config_keys=["lexical_scaler_path", "metadata_scaler_path"],
+            fallback_filenames=[
+                "lexical_metadata_scaler.pkl",
+                "metadata_scaler.pkl",
+            ],
+            required=True,
+            label="lexical/metadata scaler",
+        )
 
-        self.scaler = MetadataFeatureScaler.load(scaler_candidate)
+        self.embedding_scaler_path = self._resolve_config_path(
+            explicit_path=embedding_scaler_path,
+            config_keys=["embedding_feature_scaler_path", "embedding_scaler_path"],
+            fallback_filenames=[
+                "embedding_metadata_scaler.pkl",
+                "embedding_scaler.pkl",
+            ],
+            required=True,
+            label="embedding scaler",
+        )
+
+        self.token_scaler_path = self._resolve_config_path(
+            explicit_path=token_scaler_path,
+            config_keys=["token_feature_scaler_path", "token_scaler_path"],
+            fallback_filenames=[
+                "token_metadata_scaler.pkl",
+                "token_scaler.pkl",
+            ],
+            required=True,
+            label="token scaler",
+        )
+
+        print(f"[MetadataEnrichedQualT5Scorer] lexical_scaler_path={self.lexical_scaler_path}")
+        print(f"[MetadataEnrichedQualT5Scorer] embedding_scaler_path={self.embedding_scaler_path}")
+        print(f"[MetadataEnrichedQualT5Scorer] token_scaler_path={self.token_scaler_path}")
+
+        self.scaler = MetadataFeatureScaler.load(self.lexical_scaler_path)
+
         if list(self.lexical_store.feature_names) != list(self.scaler.feature_names):
+            print(
+                "[MetadataEnrichedQualT5Scorer] Re-loading lexical metadata store "
+                "with feature names from lexical scaler."
+            )
             self.lexical_store = LexicalMetadataStore.from_path(
                 self.metadata_path,
                 feature_names=self.scaler.feature_names,
             )
 
+        if list(self.lexical_store.feature_names) != list(self.scaler.feature_names):
+            raise ValueError(
+                "Mismatch tra lexical_store.feature_names e lexical scaler features.\n"
+                f"store={self.lexical_store.feature_names}\n"
+                f"scaler={self.scaler.feature_names}"
+            )
+
+        # ------------------------------------------------------------
+        # Load tokenizer and true/false token ids.
+        # ------------------------------------------------------------
         print(
             f"Inizializzazione MetadataEnrichedQualT5Scorer "
             f"(model={self.model_name_or_path}, device={self.device}, "
@@ -501,44 +572,119 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
         )
 
         targets = ["true", "false"]
+
         true_token_id = self.tokenizer.encode(
             targets[0],
             add_special_tokens=False,
         )[0]
+
         false_token_id = self.tokenizer.encode(
             targets[1],
             add_special_tokens=False,
         )[0]
 
-        if scoring_mode is None:
-            scoring_mode = saved_meta_cfg.get("scoring_mode", "true_logprob")
+        self.true_token_id = int(true_token_id)
+        self.false_token_id = int(false_token_id)
 
-        if "metadata_dropout" in saved_meta_cfg:
-            metadata_dropout = saved_meta_cfg["metadata_dropout"]
-        if "metadata_mlp_hidden_dim" in saved_meta_cfg and metadata_mlp_hidden_dim is None:
-            metadata_mlp_hidden_dim = saved_meta_cfg["metadata_mlp_hidden_dim"]
-        if "attention_heads" in saved_meta_cfg:
-            attention_heads = saved_meta_cfg["attention_heads"]
-        if "use_meta_ffn" in saved_meta_cfg:
-            use_meta_ffn = saved_meta_cfg["use_meta_ffn"]
+        # ------------------------------------------------------------
+        # Resolve model hyperparameters.
+        # Important: use saved config first, because metadata_dropout changes
+        # Sequential module structure if Dropout was present during training.
+        # ------------------------------------------------------------
+        scoring_mode = self.saved_meta_cfg.get(
+            "scoring_mode",
+            scoring_mode if scoring_mode is not None else "true_logprob",
+        )
+
+        metadata_dropout = self.saved_meta_cfg.get(
+            "metadata_dropout",
+            metadata_dropout if metadata_dropout is not None else 0.0,
+        )
+
+        metadata_mlp_hidden_dim = self.saved_meta_cfg.get(
+            "metadata_mlp_hidden_dim",
+            metadata_mlp_hidden_dim,
+        )
+
+        attention_heads = self.saved_meta_cfg.get(
+            "attention_heads",
+            attention_heads if attention_heads is not None else 8,
+        )
+
+        use_meta_ffn = self.saved_meta_cfg.get(
+            "use_meta_ffn",
+            use_meta_ffn if use_meta_ffn is not None else True,
+        )
+
+        metadata_fusion_mode = self.saved_meta_cfg.get(
+            "metadata_fusion_mode",
+            metadata_fusion_mode if metadata_fusion_mode is not None else "pooled_concat_projection",
+        )
+
+        normalize_metadata_features = self.saved_meta_cfg.get(
+            "normalize_metadata_features",
+            normalize_metadata_features if normalize_metadata_features is not None else False,
+        )
+
+        unfreeze_last_n_decoder_blocks = self.saved_meta_cfg.get(
+            "unfreeze_last_n_decoder_blocks",
+            unfreeze_last_n_decoder_blocks if unfreeze_last_n_decoder_blocks is not None else 1,
+        )
+
+        unfreeze_lm_head = self.saved_meta_cfg.get(
+            "unfreeze_lm_head",
+            unfreeze_lm_head if unfreeze_lm_head is not None else True,
+        )
+
+        if metadata_fusion_mode not in self.VALID_FUSION_MODES:
+            raise ValueError(
+                f"metadata_fusion_mode={metadata_fusion_mode!r} non supportato. "
+                f"Valori ammessi: {sorted(self.VALID_FUSION_MODES)}"
+            )
+
+        print(
+            "[MetadataEnrichedQualT5Scorer] Effective model config | "
+            f"scoring_mode={scoring_mode} | "
+            f"metadata_dropout={metadata_dropout} | "
+            f"metadata_mlp_hidden_dim={metadata_mlp_hidden_dim} | "
+            f"attention_heads={attention_heads} | "
+            f"use_meta_ffn={use_meta_ffn} | "
+            f"metadata_fusion_mode={metadata_fusion_mode} | "
+            f"normalize_metadata_features={normalize_metadata_features} | "
+            f"unfreeze_last_n_decoder_blocks={unfreeze_last_n_decoder_blocks} | "
+            f"unfreeze_lm_head={unfreeze_lm_head}"
+        )
 
         self.model = MetadataEnrichedQualT5(
             model_name_or_path=self.model_name_or_path,
             lexical_feature_dim=len(self.lexical_store.feature_names),
-            true_token_id=true_token_id,
-            false_token_id=false_token_id,
+            true_token_id=self.true_token_id,
+            false_token_id=self.false_token_id,
             scoring_mode=scoring_mode,
             metadata_mlp_hidden_dim=metadata_mlp_hidden_dim,
             metadata_dropout=float(metadata_dropout),
             attention_heads=int(attention_heads),
             use_meta_ffn=bool(use_meta_ffn),
+            normalize_metadata_features=bool(normalize_metadata_features),
+            unfreeze_last_n_decoder_blocks=int(unfreeze_last_n_decoder_blocks),
+            unfreeze_lm_head=bool(unfreeze_lm_head),
+            metadata_fusion_mode=str(metadata_fusion_mode),
+
+            # Lexical features are already standardized in _score_batch().
+            lexical_feature_scaler_path=None,
+
+            # x_emb and x_tok are computed online in model.forward(),
+            # so their scalers must be loaded inside the model.
+            embedding_feature_scaler_path=self.embedding_scaler_path,
+            token_feature_scaler_path=self.token_scaler_path,
         )
+
         self.model.load_metadata_modules(self.model_name_or_path)
         self.model.to(self.device)
         self.model.eval()
 
-        # Manteniamo lo stesso identico criterio di score finale di QualT5:
-        # quality = log_softmax([logit_true, logit_false])[:, 0]
+        # Final score aligned with QualT5:
+        # quality = log P(true | true,false)
         self.model.scoring_mode = "true_logprob"
 
     def _resolve_device(self, requested_device):
@@ -549,6 +695,53 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             return torch.device(requested_device)
 
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _resolve_model_relative_path(self, path_value):
+        if path_value is None:
+            return None
+
+        p = Path(str(path_value))
+
+        if p.is_absolute():
+            return str(p)
+
+        return str(self.model_dir / p)
+
+    def _resolve_config_path(
+        self,
+        *,
+        explicit_path,
+        config_keys,
+        fallback_filenames,
+        required,
+        label,
+    ):
+        candidates = []
+
+        if explicit_path is not None:
+            candidates.append(explicit_path)
+
+        for key in config_keys:
+            value = self.saved_meta_cfg.get(key)
+            if value:
+                candidates.append(value)
+
+        for filename in fallback_filenames:
+            candidates.append(filename)
+
+        for candidate in candidates:
+            resolved = self._resolve_model_relative_path(candidate)
+            if resolved is not None and Path(resolved).exists():
+                return resolved
+
+        if required:
+            raise FileNotFoundError(
+                f"Non riesco a trovare {label}. "
+                f"Candidati provati: {candidates}. "
+                f"Model dir: {self.model_dir}"
+            )
+
+        return None
 
     def _build_prompt(self, passage_text):
         return self.prompt.format(passage_text)
@@ -568,7 +761,9 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             batch_docnos,
             allow_missing_metadata=self.allow_missing_metadata,
         )
+
         lexical_norm = self.scaler.transform(lexical_raw)
+
         lexical_features = torch.tensor(
             lexical_norm,
             dtype=torch.float32,
@@ -583,6 +778,7 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
         batch_size = len(batch_texts)
 
         decoder_start_token_id = self.model.base_model.config.decoder_start_token_id
+
         if decoder_start_token_id is None:
             decoder_start_token_id = self.tokenizer.pad_token_id
 
@@ -606,14 +802,15 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
                 decoder_input_ids=decoder_input_ids,
             )
 
-            # Calcolo finale allineato a FinetunedQualT5Scorer.
+            # Always compute final quality as log P(true | true,false).
             pair_logits = torch.stack(
                 [outputs["logits_true"], outputs["logits_false"]],
                 dim=1,
             )
+
             quality_scores = F.log_softmax(pair_logits, dim=1)[:, 0]
 
-        return quality_scores.detach().cpu().tolist()
+        return quality_scores.detach().float().cpu().tolist()
 
     def transform(self, df):
         res = df.copy()
@@ -622,6 +819,7 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             raise ValueError(
                 "MetadataEnrichedQualT5Scorer richiede una colonna 'text'."
             )
+
         if "docno" not in res.columns:
             raise ValueError(
                 "MetadataEnrichedQualT5Scorer richiede una colonna 'docno'."
@@ -633,6 +831,7 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
         quality_scores = []
 
         iterator = range(0, len(texts), self.batch_size)
+
         if self.verbose:
             iterator = pt.tqdm(
                 iterator,
@@ -642,12 +841,15 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
 
         for start_idx in iterator:
             end_idx = start_idx + self.batch_size
+
             batch_texts = texts[start_idx:end_idx]
             batch_docnos = docnos[start_idx:end_idx]
+
             batch_scores = self._score_batch(batch_docnos, batch_texts)
             quality_scores.extend(float(score) for score in batch_scores)
 
         res["quality"] = quality_scores
+
         return res
     
     
@@ -676,25 +878,42 @@ def get_scorer(nome_scorer, **kwargs):
             device=kwargs.get("device"),
         )
 
-    elif nome_scorer in ('metadata_qualt5', 'metadata_enriched_qualt5'):
+    elif nome_scorer in ("metadata_qualt5", "metadata_enriched_qualt5"):
         lexical_feature_names = kwargs.get("lexical_feature_names")
+
         if lexical_feature_names is None:
             groups = kwargs.get("metadata_feature_groups", {})
             lexical_feature_names = groups.get("lexical")
+
         return MetadataEnrichedQualT5Scorer(
             model_name_or_path=kwargs.get("model_name_or_path"),
             metadata_path=kwargs.get("metadata_path"),
+
+        # Backward-compatible lexical scaler.
             metadata_scaler_path=kwargs.get("metadata_scaler_path"),
+            lexical_scaler_path=kwargs.get("lexical_scaler_path"),
+
+        # New online feature scalers.
+            embedding_scaler_path=kwargs.get("embedding_scaler_path"),
+            token_scaler_path=kwargs.get("token_scaler_path"),
+
             lexical_feature_names=lexical_feature_names,
             batch_size=kwargs.get("batch_size", 100),
             max_length=kwargs.get("max_length", 512),
             device=kwargs.get("device"),
-            scoring_mode=kwargs.get("scoring_mode", "true_logprob"),
+            scoring_mode=kwargs.get("scoring_mode"),
             allow_missing_metadata=kwargs.get("allow_missing_metadata", False),
-            metadata_dropout=kwargs.get("metadata_dropout", 0.1),
+
+            metadata_dropout=kwargs.get("metadata_dropout"),
             metadata_mlp_hidden_dim=kwargs.get("metadata_mlp_hidden_dim"),
-            attention_heads=kwargs.get("attention_heads", 8),
-            use_meta_ffn=kwargs.get("use_meta_ffn", True),
+            attention_heads=kwargs.get("attention_heads"),
+            use_meta_ffn=kwargs.get("use_meta_ffn"),
+
+            metadata_fusion_mode=kwargs.get("metadata_fusion_mode"),
+            normalize_metadata_features=kwargs.get("normalize_metadata_features"),
+            unfreeze_last_n_decoder_blocks=kwargs.get("unfreeze_last_n_decoder_blocks"),
+            unfreeze_lm_head=kwargs.get("unfreeze_lm_head"),
+
             verbose=kwargs.get("verbose", False),
         )
         

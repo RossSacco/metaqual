@@ -10,22 +10,42 @@ from pyterrier_quality import QualCache
 def get_scorer_name_from_cache(filename, dataset_name):
     """
     Esempi:
-    finetuned_qualt5_msmarco_passage.cache        -> finetuned_qualt5
-    metadata_qualt5_msmarco_passage_nuovo.cache  -> finetuned_qualt5_nuovo
-    qualt5_msmarco_passage.cache                  -> qualt5
-    tasb_msmarco_passage.cache                    -> tasb
+    finetuned_qualt5_msmarco_passage.cache         -> finetuned_qualt5
+    metadata_qualt5_msmarco_passage_nuovo.cache   -> metadata_qualt5_nuovo
+    metadata_qualt5_msmarco_passage_CONCAT.cache  -> metadata_qualt5_concat
+    qualt5_msmarco_passage.cache                   -> qualt5
+    tasb_msmarco_passage.cache                     -> tasb
     """
 
     suffix_nuovo = f"_{dataset_name}_nuovo.cache"
+    suffix_concat_upper = f"_{dataset_name}_CONCAT.cache"
+    suffix_concat_lower = f"_{dataset_name}_concat.cache"
+    suffix_mp = f"_{dataset_name}_MP.cache"
     suffix = f"_{dataset_name}.cache"
 
+    # Caso _nuovo
     if filename.endswith(suffix_nuovo):
         base_name = filename[:-len(suffix_nuovo)]
         return f"{base_name}_nuovo"
 
+    # Caso _CONCAT oppure _concat
+    if filename.endswith(suffix_concat_upper):
+        base_name = filename[:-len(suffix_concat_upper)]
+        return f"{base_name}_concat"
+
+    if filename.endswith(suffix_concat_lower):
+        base_name = filename[:-len(suffix_concat_lower)]
+        return f"{base_name}_concat"
+    
+    if filename.endswith(suffix_mp):
+        base_name = filename[:-len(suffix_mp)]
+        return f"{base_name}_MP"
+
+    # Caso normale
     if filename.endswith(suffix):
         return filename[:-len(suffix)]
 
+    # Fallback
     return filename.replace(".cache", "")
 
 
@@ -91,9 +111,12 @@ def prepare_data(
         scorer_name = get_scorer_name_from_cache(file, dataset_name)
 
         # Se vuoi usare il fine-tuned al posto del QualT5 normale,
-        # puoi ignorare qualt5 quando esiste finetuned_qualt5.
+        # ignori solo il QualT5 ufficiale/base.
         if scorer_name == "qualt5":
             print(f"\nSkippo {file}, perché vuoi usare finetuned_qualt5 al posto di qualt5.")
+            continue
+        if scorer_name == "metadata_qualt5":
+            print(f"\nSkippo {file}, perché vuoi usare metadata_qualt5_concat al posto di metadata_qualt5.")
             continue
 
         print(f"\nCaricamento punteggi per: {scorer_name}")
@@ -125,7 +148,10 @@ def prepare_data(
         results["scorers"][scorer_name] = scores
 
         print(f"[OK] {len(scores)} punteggi caricati correttamente.")
-        print(f"Min/Max/Mean: {scores.min():.6f} / {scores.max():.6f} / {scores.mean():.6f}")
+        print(
+            f"Min/Max/Mean: "
+            f"{scores.min():.6f} / {scores.max():.6f} / {scores.mean():.6f}"
+        )
 
     print("\nScorers salvati nel file:")
     print(list(results["scorers"].keys()))
@@ -135,6 +161,13 @@ def prepare_data(
             "\n[WARNING] Non è stato trovato 'finetuned_qualt5'. "
             "Controlla che la cache si chiami esattamente "
             f"'finetuned_qualt5_{dataset_name}.cache'."
+        )
+
+    if "metadata_qualt5_concat" not in results["scorers"]:
+        print(
+            "\n[WARNING] Non è stato trovato 'metadata_qualt5_concat'. "
+            "Controlla che la cache si chiami per esempio "
+            f"'metadata_qualt5_{dataset_name}_CONCAT.cache'."
         )
 
     with open(output_file, "wb") as f:

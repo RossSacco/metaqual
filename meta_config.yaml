@@ -8,9 +8,19 @@ dataset:
     - "test-2020"
 
 experiment:
+  # Nome logico dello scorer, cioè quello usato dal tuo codice in get_scorer/base_scorer.
   scorer: "metadata_qualt5"
-  index_scorer_name: "metadata_qualt5_MP"
-  threshold: 0.15
+
+  # Nome specifico dell'esperimento/cache.
+  # Verrà usato per nominare la cartella degli indici.
+  scorer_output_name: "metadata_qualt5_MP"
+
+  # Cache effettiva da usare.
+  # Lo script cercherà:
+  # /data/data-sacco/cache/metadata_qualt5_msmarco_passage_MP.cache
+  cache_file: "metadata_qualt5_msmarco_passage_MP.cache"
+
+  threshold: 0.60
   restart_cache: false
   retriever: "all"
 
@@ -32,13 +42,12 @@ scorers:
     model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP"
     metadata_path: "/home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet"
 
-    # Scaler lessicale. Puoi lasciare anche metadata_scaler_path per compatibilità.
     lexical_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP/lexical_metadata_scaler.pkl"
     metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP/lexical_metadata_scaler.pkl"
 
-    # Scaler delle feature online x_emb e x_tok.
     embedding_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP/embedding_metadata_scaler.pkl"
     token_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP/token_metadata_scaler.pkl"
+
     batch_size: 100
     max_length: 512
     device: "cuda"
@@ -46,7 +55,6 @@ scorers:
     scoring_mode: "true_logprob"
     allow_missing_metadata: false
 
-    # Deve combaciare con la run.
     metadata_fusion_mode: "concat_tokens"
     metadata_dropout: 0.1
     metadata_mlp_hidden_dim: 256
