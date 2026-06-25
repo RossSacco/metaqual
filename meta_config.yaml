@@ -13,14 +13,14 @@ experiment:
 
   # Nome specifico dell'esperimento/cache.
   # Verrà usato per nominare la cartella degli indici.
-  scorer_output_name: "metadata_qualt5_MP"
+  scorer_output_name: "metadata_qualt5_CONCAT"
 
   # Cache effettiva da usare.
   # Lo script cercherà:
-  # /data/data-sacco/cache/metadata_qualt5_msmarco_passage_MP.cache
-  cache_file: "metadata_qualt5_msmarco_passage_MP.cache"
+  # /data/data-sacco/cache/metadata_qualt5_msmarco_passage_CONCAT.cache
+  cache_file: "metadata_qualt5_msmarco_passage_CONCAT.cache"
 
-  threshold: 0.60
+  threshold: 0.15
   restart_cache: false
   retriever: "all"
 

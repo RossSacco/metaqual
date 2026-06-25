@@ -27,6 +27,7 @@ def paired_ci(diffs, alpha=0.05):
 def run_pruning_tost(path, alpha=0.05, rel_lower_bound=0.05, upper_bound=1e6):
     df = pd.read_csv(path)
     KNOWN_SCORERS = [
+        "metadata_qualt5",
         "finetuned_qualt5",
         "perplexity",
         "qualt5",

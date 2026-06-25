@@ -206,18 +206,24 @@ def get_pruned_runs_dir(config: Dict[str, Any], scorer_name: str) -> str:
     """
     Directory per salvare/riusare le run pruned.
 
-    Nota:
-    - scorer_name è il nome logico dello scorer, per esempio metadata_qualt5.
-    - index_scorer_name serve solo per trovare la cartella fisica dell'indice.
+    Usa lo stesso nome fisico usato per l'indice, cioè index_scorer_name.
+    Esempio:
+        scorer_name = metadata_qualt5
+        index_scorer_name = metadata_qualt5_MP
+
+    Allora salva in:
+        runs_all_metadata_qualt5_MP_test-2019_test-2020_0.6
     """
     active_retriever = config["experiment"].get("retriever", "all").lower()
     threshold = config["experiment"]["threshold"]
     qrels_name = get_qrels_name(config)
     base_runs_dir = get_base_runs_dir(config)
 
+    index_scorer_name = get_index_scorer_name(config, scorer_name)
+
     pruned_runs_dir = os.path.join(
         base_runs_dir,
-        f"runs_{active_retriever}_{scorer_name}_{qrels_name}_{threshold}"
+        f"runs_{active_retriever}_{index_scorer_name}_{qrels_name}_{threshold}"
     )
 
     os.makedirs(pruned_runs_dir, exist_ok=True)
@@ -802,7 +808,7 @@ def run_single_scorer_evaluation(
         res_avg=res_avg,
         res_perq=res_perq,
         timings_df=timings_df,
-        scorer_name=scorer_name,
+        scorer_name=index_scorer_name,
         threshold=threshold,
         active_retriever=active_retriever,
         qrels_variant=qrels_name,
@@ -865,3 +871,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
+    

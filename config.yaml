@@ -10,7 +10,7 @@ dataset:
 experiment:
   scorer: "metadata_qualt5"
   index_scorer_name: "metadata_qualt5_MP"
-  threshold: 0.15
+  threshold: 0.60
   restart_cache: false
   retriever: "all"
 

@@ -297,3 +297,5 @@ if __name__ == "__main__":
         config = yaml.safe_load(f)
 
     run_full_pruning_and_indexing(config)
+    
+    

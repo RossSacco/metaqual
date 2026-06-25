@@ -1,2 +1,0 @@
-/home/sacco/metaqual/venv/bin/python: Error while finding module specification for 'metaqual.experiments.phase1_qualityscores' (ModuleNotFoundError: No module named 'metaqual')
-/home/sacco/metaqual/venv/bin/python: Error while finding module specification for 'metaqual.pruning.meta_pruner' (ModuleNotFoundError: No module named 'metaqual')
