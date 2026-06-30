@@ -20,12 +20,16 @@ try:
         MetadataQualT5TriplesIterableDataset,
     )
     from metaqual.models.metadata_qualt5 import (
+        DEFAULT_EMBEDDING_FEATURE_TRANSFORMS,
+        DEFAULT_LEXICAL_FEATURE_TRANSFORMS,
+        DEFAULT_TOKEN_FEATURE_TRANSFORMS,
         EMBEDDING_FEATURE_NAMES,
         TOKEN_FEATURE_NAMES,
         LexicalMetadataStore,
         MetadataEnrichedQualT5,
         MetadataFeatureScaler,
         RunningMoments,
+        build_feature_transform_map,
         fit_online_metadata_scalers,
     )
 except ImportError:
@@ -33,12 +37,16 @@ except ImportError:
         MetadataQualT5TriplesIterableDataset,
     )
     from models.metadata_qualt5 import (
+        DEFAULT_EMBEDDING_FEATURE_TRANSFORMS,
+        DEFAULT_LEXICAL_FEATURE_TRANSFORMS,
+        DEFAULT_TOKEN_FEATURE_TRANSFORMS,
         EMBEDDING_FEATURE_NAMES,
         TOKEN_FEATURE_NAMES,
         LexicalMetadataStore,
         MetadataEnrichedQualT5,
         MetadataFeatureScaler,
         RunningMoments,
+        build_feature_transform_map,
         fit_online_metadata_scalers,
     )
 
@@ -165,6 +173,50 @@ def _relative_if_inside_output(path: str | Path, output_dir: str | Path) -> str:
     return str(path)
 
 
+
+def _identity_transforms(feature_names) -> Dict[str, str]:
+    return {name: "identity" for name in feature_names}
+
+
+def _zscore_transforms(feature_names) -> Dict[str, str]:
+    return {name: "zscore" for name in feature_names}
+
+
+def _resolve_feature_transforms(
+    *,
+    feature_names,
+    default_map: Dict[str, str],
+    normalization_mode: str,
+) -> Dict[str, str]:
+    """
+    Resolve the transform used by the scaler for each feature.
+
+    normalization_mode:
+    - zscore:        old behaviour, all features use z-score;
+    - feature_aware: feature-specific transforms;
+    - none:          no offline/online scaling, raw values are used.
+    """
+    normalization_mode = str(normalization_mode)
+
+    if normalization_mode == "zscore":
+        return _zscore_transforms(feature_names)
+
+    if normalization_mode == "none":
+        return _identity_transforms(feature_names)
+
+    if normalization_mode == "feature_aware":
+        return build_feature_transform_map(
+            feature_names,
+            default_map,
+            fallback="zscore",
+        )
+
+    raise ValueError(
+        "metadata_normalization_mode must be one of: zscore, feature_aware, none. "
+        f"Got {normalization_mode!r}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Training metadata-aware QualT5 from a fine-tuned QualT5 checkpoint."
@@ -200,6 +252,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
 
     parser.add_argument("--allow_missing_metadata", action="store_true")
+
+
+    parser.add_argument(
+        "--metadata_normalization_mode",
+        type=str,
+        choices=["zscore", "feature_aware", "none"],
+        default="feature_aware",
+        help=(
+            "How metadata scalers are fitted. "
+            "'zscore' reproduces the old behaviour. "
+            "'feature_aware' uses log1p+zscore for count/norm features, "
+            "identity for ratio features, and zscore for compact statistics. "
+            "'none' disables scaling and keeps raw values."
+        ),
+    )
 
     parser.add_argument("--max_scaler_examples", type=int, default=500000)
     parser.add_argument(
@@ -299,6 +366,7 @@ def _fit_lexical_scaler_on_training_docnos(
     args: argparse.Namespace,
     tokenizer,
     lexical_store: LexicalMetadataStore,
+    lexical_feature_transforms: Dict[str, str],
 ) -> MetadataFeatureScaler:
     LOGGER.info("Inizio fit scaler sui metadata lessicali dei docno del training...")
     _log_memory("Prima del fit lexical scaler")
@@ -312,6 +380,7 @@ def _fit_lexical_scaler_on_training_docnos(
         feature_names=lexical_store.feature_names,
         mean=np.zeros(feature_dim, dtype=np.float32),
         std=np.ones(feature_dim, dtype=np.float32),
+        feature_transforms=_identity_transforms(lexical_store.feature_names),
     )
 
     dataset_for_fit = MetadataQualT5TriplesIterableDataset(
@@ -328,7 +397,11 @@ def _fit_lexical_scaler_on_training_docnos(
         allow_missing_metadata=args.allow_missing_metadata,
     )
 
-    moments = RunningMoments(dim=feature_dim)
+    moments = RunningMoments(
+        dim=feature_dim,
+        feature_names=lexical_store.feature_names,
+        feature_transforms=lexical_feature_transforms,
+    )
     start_time = time.time()
 
     for idx, (docno, _passage, _label) in enumerate(dataset_for_fit.iter_raw_examples(), 1):
@@ -358,7 +431,7 @@ def _fit_lexical_scaler_on_training_docnos(
             )
             break
 
-    scaler = moments.finalize(feature_names=lexical_store.feature_names)
+    scaler = moments.finalize()
 
     elapsed = time.time() - start_time
     LOGGER.info(
@@ -378,6 +451,8 @@ def _fit_and_save_online_scalers(
     lexical_scaler: MetadataFeatureScaler,
     embedding_scaler_path: str,
     token_scaler_path: str,
+    embedding_feature_transforms: Dict[str, str],
+    token_feature_transforms: Dict[str, str],
 ) -> tuple[MetadataFeatureScaler, MetadataFeatureScaler]:
     LOGGER.info("Inizio fit scaler online per x_emb e x_tok...")
     LOGGER.info("Embedding scaler path: %s", embedding_scaler_path)
@@ -425,6 +500,8 @@ def _fit_and_save_online_scalers(
         input_ids_key="input_ids",
         attention_mask_key="attention_mask",
         max_batches=max_batches,
+        embedding_feature_transforms=embedding_feature_transforms,
+        token_feature_transforms=token_feature_transforms,
     )
 
     emb_scaler.save(embedding_scaler_path)
@@ -547,6 +624,27 @@ def main() -> None:
     )
     LOGGER.info("Lexical feature names: %s", lexical_store.feature_names)
 
+    lexical_feature_transforms = _resolve_feature_transforms(
+        feature_names=lexical_store.feature_names,
+        default_map=DEFAULT_LEXICAL_FEATURE_TRANSFORMS,
+        normalization_mode=args.metadata_normalization_mode,
+    )
+    embedding_feature_transforms = _resolve_feature_transforms(
+        feature_names=EMBEDDING_FEATURE_NAMES,
+        default_map=DEFAULT_EMBEDDING_FEATURE_TRANSFORMS,
+        normalization_mode=args.metadata_normalization_mode,
+    )
+    token_feature_transforms = _resolve_feature_transforms(
+        feature_names=TOKEN_FEATURE_NAMES,
+        default_map=DEFAULT_TOKEN_FEATURE_TRANSFORMS,
+        normalization_mode=args.metadata_normalization_mode,
+    )
+
+    LOGGER.info("metadata_normalization_mode=%s", args.metadata_normalization_mode)
+    LOGGER.info("Lexical feature transforms: %s", lexical_feature_transforms)
+    LOGGER.info("Embedding feature transforms: %s", embedding_feature_transforms)
+    LOGGER.info("Token feature transforms: %s", token_feature_transforms)
+
     _log_memory("Dopo caricamento lexical metadata")
 
     lexical_scaler_path = (
@@ -558,12 +656,21 @@ def main() -> None:
     if Path(lexical_scaler_path).exists():
         LOGGER.info("Carico lexical scaler già esistente da: %s", lexical_scaler_path)
         lexical_scaler = MetadataFeatureScaler.load(lexical_scaler_path)
+        if getattr(lexical_scaler, "feature_transforms", None) != lexical_feature_transforms:
+            LOGGER.warning(
+                "Il lexical scaler esistente usa transforms diversi da quelli richiesti. "
+                "Se vuoi rifittare la feature-aware normalization, elimina lo scaler o usa un nuovo output_dir. "
+                "loaded=%s requested=%s",
+                getattr(lexical_scaler, "feature_transforms", None),
+                lexical_feature_transforms,
+            )
     else:
         LOGGER.info("Lexical scaler non trovato. Lo calcolo ora...")
         lexical_scaler = _fit_lexical_scaler_on_training_docnos(
             args=args,
             tokenizer=tokenizer,
             lexical_store=lexical_store,
+            lexical_feature_transforms=lexical_feature_transforms,
         )
 
         LOGGER.info("Salvo lexical scaler in: %s", lexical_scaler_path)
@@ -584,6 +691,25 @@ def main() -> None:
         LOGGER.info("Online scalers già esistenti. Skip fit.")
         LOGGER.info("Embedding scaler: %s", embedding_scaler_path)
         LOGGER.info("Token scaler: %s", token_scaler_path)
+
+        loaded_emb_scaler = MetadataFeatureScaler.load(embedding_scaler_path)
+        loaded_tok_scaler = MetadataFeatureScaler.load(token_scaler_path)
+
+        if getattr(loaded_emb_scaler, "feature_transforms", None) != embedding_feature_transforms:
+            LOGGER.warning(
+                "L'embedding scaler esistente usa transforms diversi da quelli richiesti. "
+                "loaded=%s requested=%s",
+                getattr(loaded_emb_scaler, "feature_transforms", None),
+                embedding_feature_transforms,
+            )
+
+        if getattr(loaded_tok_scaler, "feature_transforms", None) != token_feature_transforms:
+            LOGGER.warning(
+                "Il token scaler esistente usa transforms diversi da quelli richiesti. "
+                "loaded=%s requested=%s",
+                getattr(loaded_tok_scaler, "feature_transforms", None),
+                token_feature_transforms,
+            )
     else:
         LOGGER.info("Almeno uno tra embedding/token scaler non esiste. Calcolo online scalers...")
         _fit_and_save_online_scalers(
@@ -593,6 +719,8 @@ def main() -> None:
             lexical_scaler=lexical_scaler,
             embedding_scaler_path=embedding_scaler_path,
             token_scaler_path=token_scaler_path,
+            embedding_feature_transforms=embedding_feature_transforms,
+            token_feature_transforms=token_feature_transforms,
         )
 
     _log_memory("Dopo online scalers")
@@ -777,6 +905,10 @@ def main() -> None:
         "unfreeze_last_n_decoder_blocks": args.unfreeze_last_n_decoder_blocks,
         "unfreeze_lm_head": not args.no_unfreeze_lm_head,
         "metadata_fusion_mode": args.metadata_fusion_mode,
+        "metadata_normalization_mode": args.metadata_normalization_mode,
+        "lexical_feature_transforms": lexical_feature_transforms,
+        "embedding_feature_transforms": embedding_feature_transforms,
+        "token_feature_transforms": token_feature_transforms,
         "lexical_scaler_path": lexical_scaler_cfg_value,
         "metadata_scaler_path": lexical_scaler_cfg_value,
         "embedding_scaler_path": embedding_scaler_cfg_value,
@@ -811,6 +943,12 @@ def main() -> None:
                             "embedding": embedding_scaler_cfg_value,
                             "token": token_scaler_cfg_value,
                         },
+                        "normalization": {
+                            "mode": args.metadata_normalization_mode,
+                            "lexical_feature_transforms": lexical_feature_transforms,
+                            "embedding_feature_transforms": embedding_feature_transforms,
+                            "token_feature_transforms": token_feature_transforms,
+                        },
                     }
                 }
             },
@@ -835,7 +973,7 @@ NCCL_IB_DISABLE=1 \
 nohup python -u -m metaqual.models.train_metadata_qualt5 \
   --model_name_or_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
   --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
-  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-concat-dec1-lm-h256-lr5e5-3k \
+  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-concat-featureaware-dec1-lm-h256-lr5e5-3k \
   --triples_source irds \
   --irds_dataset_id msmarco-passage/train/triples-small \
   --max_steps 3000 \
@@ -846,14 +984,15 @@ nohup python -u -m metaqual.models.train_metadata_qualt5 \
   --save_steps 1000 \
   --save_total_limit 3 \
   --logging_steps 50 \
-  --metadata_dropout 0.0 \
+  --metadata_dropout 0.1 \
   --metadata_mlp_hidden_dim 256 \
   --metadata_fusion_mode concat_tokens \
+  --metadata_normalization_mode feature_aware \
   --unfreeze_last_n_decoder_blocks 1 \
   --max_scaler_examples 500000 \
   --max_online_scaler_examples 100000 \
   --online_scaler_batch_size 16 \
   --bf16 \
-  > metaqualt5_ft.log 2>&1 &
+  > metaqualt5_featureaware.log 2>&1 &
 
 '''

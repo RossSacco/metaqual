@@ -48,6 +48,63 @@ TOKEN_FEATURE_NAMES = [
 ]
 
 
+SUPPORTED_METADATA_TRANSFORMS = {"identity", "zscore", "log1p_zscore"}
+
+DEFAULT_LEXICAL_FEATURE_TRANSFORMS = {
+    "length_tokens": "log1p_zscore",
+    "avg_token_length": "zscore",
+    "unique_token_ratio": "identity",
+    "repetition_ratio": "identity",
+    "lexical_entropy": "zscore",
+    "stopword_ratio": "identity",
+    "content_word_ratio": "identity",
+    "avg_idf": "zscore",
+    "max_idf": "zscore",
+    "idf_std": "zscore",
+}
+
+DEFAULT_EMBEDDING_FEATURE_TRANSFORMS = {
+    "embedding_l1_norm": "log1p_zscore",
+    "embedding_l2_norm": "log1p_zscore",
+    "embedding_linf_norm": "log1p_zscore",
+    "embedding_mean": "zscore",
+    "embedding_variance": "log1p_zscore",
+    "near_zero_fraction": "identity",
+}
+
+DEFAULT_TOKEN_FEATURE_TRANSFORMS = {
+    "mean_token_norm": "log1p_zscore",
+    "std_token_norm": "zscore",
+    "max_token_norm": "log1p_zscore",
+    "token_norm_entropy": "zscore",
+    "token_to_passage_similarity_mean": "zscore",
+}
+
+
+def build_feature_transform_map(
+    feature_names: Sequence[str],
+    default_map: Optional[Dict[str, str]] = None,
+    *,
+    fallback: str = "zscore",
+) -> Dict[str, str]:
+    if fallback not in SUPPORTED_METADATA_TRANSFORMS:
+        raise ValueError(f"Unsupported fallback transform: {fallback}")
+
+    default_map = default_map or {}
+    transforms: Dict[str, str] = {}
+
+    for name in feature_names:
+        transform = default_map.get(name, fallback)
+        if transform not in SUPPORTED_METADATA_TRANSFORMS:
+            raise ValueError(
+                f"Unsupported transform {transform!r} for feature {name!r}. "
+                f"Supported transforms: {sorted(SUPPORTED_METADATA_TRANSFORMS)}"
+            )
+        transforms[name] = transform
+
+    return transforms
+
+
 def _safe_div(num: torch.Tensor, den: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     return num / den.clamp_min(eps)
 
@@ -139,30 +196,131 @@ def extract_token_level_metadata(
 
 class MetadataFeatureScaler:
     """
-    Standardization scaler for metadata features.
+    Feature-aware scaler for metadata features.
 
-    Can be used for:
-    - lexical metadata computed offline;
-    - embedding-level metadata computed online from H_text;
-    - token-level metadata computed online from H_text.
+    Supported per-feature transforms:
+    - identity:      return the raw feature unchanged;
+    - zscore:        (x - mean) / std;
+    - log1p_zscore:  (log(1 + max(x, 0)) - mean_log) / std_log.
+
+    Backward compatibility:
+    old scaler files containing only feature_names/mean/std are interpreted
+    as standard z-score scalers for all features.
     """
 
-    def __init__(self, feature_names: Sequence[str], mean: np.ndarray, std: np.ndarray):
+    def __init__(
+        self,
+        feature_names: Sequence[str],
+        mean: np.ndarray,
+        std: np.ndarray,
+        feature_transforms: Optional[Dict[str, str]] = None,
+        *,
+        eps: float = 1e-12,
+    ):
         self.feature_names = list(feature_names)
         self.mean = np.asarray(mean, dtype=np.float32)
         self.std = np.asarray(std, dtype=np.float32)
+        self.eps = float(eps)
+
+        if self.mean.ndim != 1 or self.std.ndim != 1:
+            raise ValueError(
+                "MetadataFeatureScaler expects 1D mean/std vectors, "
+                f"got mean={self.mean.shape}, std={self.std.shape}"
+            )
+
+        if self.mean.shape != self.std.shape:
+            raise ValueError(
+                "MetadataFeatureScaler mean/std shape mismatch: "
+                f"mean={self.mean.shape}, std={self.std.shape}"
+            )
+
+        if self.mean.shape[0] != len(self.feature_names):
+            raise ValueError(
+                "MetadataFeatureScaler feature dimension mismatch: "
+                f"mean/std dim={self.mean.shape[0]}, features={len(self.feature_names)}"
+            )
+
         self.std[self.std == 0.0] = 1.0
+        self.std = np.maximum(self.std, self.eps).astype(np.float32)
+
+        if feature_transforms is None:
+            feature_transforms = {name: "zscore" for name in self.feature_names}
+
+        self.feature_transforms = build_feature_transform_map(
+            self.feature_names,
+            feature_transforms,
+            fallback="zscore",
+        )
+
+        # For identity features mean/std are intentionally ignored during transform.
+        for idx, name in enumerate(self.feature_names):
+            if self.feature_transforms[name] == "identity":
+                self.mean[idx] = 0.0
+                self.std[idx] = 1.0
 
     @classmethod
-    def fit(cls, values: np.ndarray, feature_names: Sequence[str]) -> "MetadataFeatureScaler":
+    def fit(
+        cls,
+        values: np.ndarray,
+        feature_names: Sequence[str],
+        feature_transforms: Optional[Dict[str, str]] = None,
+    ) -> "MetadataFeatureScaler":
         if values.ndim != 2:
             raise ValueError(f"Expected 2D array for scaler fit, got shape={values.shape}")
 
-        mean = values.mean(axis=0)
-        std = values.std(axis=0)
+        feature_names = list(feature_names)
+        if values.shape[1] != len(feature_names):
+            raise ValueError(
+                "Feature dimension mismatch in scaler fit: "
+                f"got {values.shape[1]}, expected {len(feature_names)}"
+            )
+
+        if feature_transforms is None:
+            feature_transforms = {name: "zscore" for name in feature_names}
+
+        transforms = build_feature_transform_map(feature_names, feature_transforms)
+        transformed = cls.apply_transforms_only(values, feature_names, transforms)
+
+        mean = transformed.mean(axis=0).astype(np.float32)
+        std = transformed.std(axis=0).astype(np.float32)
         std[std == 0.0] = 1.0
 
-        return cls(feature_names=feature_names, mean=mean, std=std)
+        for idx, name in enumerate(feature_names):
+            if transforms[name] == "identity":
+                mean[idx] = 0.0
+                std[idx] = 1.0
+
+        return cls(
+            feature_names=feature_names,
+            mean=mean,
+            std=std,
+            feature_transforms=transforms,
+        )
+
+    @staticmethod
+    def apply_transforms_only(
+        values: np.ndarray,
+        feature_names: Sequence[str],
+        feature_transforms: Dict[str, str],
+    ) -> np.ndarray:
+        transformed = np.asarray(values, dtype=np.float32).copy()
+
+        for idx, name in enumerate(feature_names):
+            transform = feature_transforms.get(name, "zscore")
+
+            if transform == "identity" or transform == "zscore":
+                continue
+
+            if transform == "log1p_zscore":
+                transformed[:, idx] = np.log1p(np.clip(transformed[:, idx], 0.0, None))
+                continue
+
+            raise ValueError(
+                f"Unsupported transform {transform!r} for feature {name!r}. "
+                f"Supported transforms: {sorted(SUPPORTED_METADATA_TRANSFORMS)}"
+            )
+
+        return transformed
 
     def transform(self, values: np.ndarray) -> np.ndarray:
         if values.ndim != 2:
@@ -174,21 +332,48 @@ class MetadataFeatureScaler:
                 f"got {values.shape[1]}, expected {len(self.feature_names)}"
             )
 
-        return (values - self.mean) / self.std
+        transformed = self.apply_transforms_only(
+            values,
+            self.feature_names,
+            self.feature_transforms,
+        )
+
+        output = transformed.copy()
+        zscore_mask = np.array(
+            [self.feature_transforms[name] != "identity" for name in self.feature_names],
+            dtype=bool,
+        )
+
+        if zscore_mask.any():
+            output[:, zscore_mask] = (
+                output[:, zscore_mask] - self.mean[zscore_mask]
+            ) / self.std[zscore_mask]
+
+        return output.astype(np.float32)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "feature_names": self.feature_names,
             "mean": self.mean.tolist(),
             "std": self.std.tolist(),
+            "feature_transforms": self.feature_transforms,
+            "scaler_type": "feature_aware",
         }
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "MetadataFeatureScaler":
+        feature_names = list(payload["feature_names"])
+        feature_transforms = payload.get("feature_transforms")
+
+        # Backward compatibility with old scaler files.
+        if feature_transforms is None:
+            feature_transforms = {name: "zscore" for name in feature_names}
+
         return cls(
-            feature_names=payload["feature_names"],
+            feature_names=feature_names,
             mean=np.asarray(payload["mean"], dtype=np.float32),
             std=np.asarray(payload["std"], dtype=np.float32),
+            feature_transforms=feature_transforms,
         )
 
     def save(self, path: str | Path) -> None:
@@ -212,10 +397,16 @@ class TorchMetadataScaler(nn.Module):
     """
     Torch version of MetadataFeatureScaler.
 
-    It stores mean/std as buffers, so they move automatically to CPU/GPU
-    together with the model. This is useful for x_emb and x_tok, which are
-    computed online during forward.
+    It stores mean/std and transform identifiers as buffers, so they move
+    automatically to CPU/GPU together with the model.
     """
+
+    TRANSFORM_TO_ID = {
+        "identity": 0,
+        "zscore": 1,
+        "log1p_zscore": 2,
+    }
+    ID_TO_TRANSFORM = {value: key for key, value in TRANSFORM_TO_ID.items()}
 
     def __init__(
         self,
@@ -223,6 +414,7 @@ class TorchMetadataScaler(nn.Module):
         std: Sequence[float] | np.ndarray | torch.Tensor,
         *,
         feature_names: Optional[Sequence[str]] = None,
+        feature_transforms: Optional[Dict[str, str]] = None,
         eps: float = 1e-12,
     ):
         super().__init__()
@@ -243,8 +435,40 @@ class TorchMetadataScaler(nn.Module):
             )
 
         self.feature_names = list(feature_names) if feature_names is not None else None
+
+        if self.feature_names is None:
+            self.feature_transforms = None
+            transform_ids = torch.ones_like(mean_tensor, dtype=torch.long)
+        else:
+            if len(self.feature_names) != mean_tensor.numel():
+                raise ValueError(
+                    "TorchMetadataScaler feature dimension mismatch: "
+                    f"features={len(self.feature_names)}, mean/std={mean_tensor.numel()}"
+                )
+
+            if feature_transforms is None:
+                feature_transforms = {name: "zscore" for name in self.feature_names}
+
+            self.feature_transforms = build_feature_transform_map(
+                self.feature_names,
+                feature_transforms,
+                fallback="zscore",
+            )
+
+            transform_ids = torch.tensor(
+                [self.TRANSFORM_TO_ID[self.feature_transforms[name]] for name in self.feature_names],
+                dtype=torch.long,
+            )
+
+            for idx, name in enumerate(self.feature_names):
+                if self.feature_transforms[name] == "identity":
+                    mean_tensor[idx] = 0.0
+                    std_tensor[idx] = 1.0
+
+        self.eps = float(eps)
         self.register_buffer("mean", mean_tensor)
         self.register_buffer("std", std_tensor)
+        self.register_buffer("transform_ids", transform_ids)
 
     @classmethod
     def from_metadata_scaler(cls, scaler: MetadataFeatureScaler) -> "TorchMetadataScaler":
@@ -252,6 +476,7 @@ class TorchMetadataScaler(nn.Module):
             mean=scaler.mean,
             std=scaler.std,
             feature_names=scaler.feature_names,
+            feature_transforms=scaler.feature_transforms,
         )
 
     @classmethod
@@ -272,8 +497,24 @@ class TorchMetadataScaler(nn.Module):
 
         mean = self.mean.to(device=values.device, dtype=values.dtype)
         std = self.std.to(device=values.device, dtype=values.dtype)
+        transform_ids = self.transform_ids.to(device=values.device)
 
-        return (values - mean) / std
+        transformed = values
+
+        log_mask = transform_ids == self.TRANSFORM_TO_ID["log1p_zscore"]
+        if bool(log_mask.any()):
+            transformed = transformed.clone()
+            transformed[:, log_mask] = torch.log1p(transformed[:, log_mask].clamp_min(0.0))
+
+        zscore_mask = transform_ids != self.TRANSFORM_TO_ID["identity"]
+        if bool(zscore_mask.any()):
+            output = transformed.clone()
+            output[:, zscore_mask] = (
+                output[:, zscore_mask] - mean[zscore_mask]
+            ) / std[zscore_mask]
+            return output
+
+        return transformed
 
 
 class LexicalMetadataStore:
@@ -1035,13 +1276,41 @@ class MetadataEnrichedQualT5(nn.Module):
 class RunningMoments:
     """
     Streaming mean/std estimator for scaler fitting.
+
+    The estimator first applies the configured per-feature transform
+    and then computes mean/std on the transformed values.
     """
 
-    def __init__(self, dim: int):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        feature_names: Optional[Sequence[str]] = None,
+        feature_transforms: Optional[Dict[str, str]] = None,
+    ):
         self.dim = int(dim)
         self.count = 0
         self.mean = np.zeros(self.dim, dtype=np.float64)
         self.m2 = np.zeros(self.dim, dtype=np.float64)
+
+        if feature_names is None:
+            feature_names = [f"feature_{i}" for i in range(self.dim)]
+
+        if len(feature_names) != self.dim:
+            raise ValueError(
+                f"RunningMoments feature_names length mismatch: {len(feature_names)} != {self.dim}"
+            )
+
+        self.feature_names = list(feature_names)
+
+        if feature_transforms is None:
+            feature_transforms = {name: "zscore" for name in self.feature_names}
+
+        self.feature_transforms = build_feature_transform_map(
+            self.feature_names,
+            feature_transforms,
+            fallback="zscore",
+        )
 
     def update(self, batch_values: np.ndarray) -> None:
         if batch_values.ndim != 2 or batch_values.shape[1] != self.dim:
@@ -1050,24 +1319,43 @@ class RunningMoments:
                 f"expected [N, {self.dim}]"
             )
 
-        for row in batch_values:
+        transformed = MetadataFeatureScaler.apply_transforms_only(
+            batch_values,
+            self.feature_names,
+            self.feature_transforms,
+        ).astype(np.float64)
+
+        for row in transformed:
             self.count += 1
             delta = row - self.mean
             self.mean += delta / self.count
             delta2 = row - self.mean
             self.m2 += delta * delta2
 
-    def finalize(self, feature_names: Sequence[str]) -> MetadataFeatureScaler:
+    def finalize(self, feature_names: Optional[Sequence[str]] = None) -> MetadataFeatureScaler:
         if self.count == 0:
             raise ValueError("Cannot finalize RunningMoments with count=0")
 
+        if feature_names is not None and list(feature_names) != self.feature_names:
+            raise ValueError(
+                "RunningMoments.finalize received feature_names different from those used at init. "
+                f"init={self.feature_names}, finalize={list(feature_names)}"
+            )
+
         variance = self.m2 / max(self.count, 1)
-        std = np.sqrt(np.maximum(variance, 1e-12))
+        std = np.sqrt(np.maximum(variance, 1e-12)).astype(np.float32)
+        mean = self.mean.astype(np.float32)
+
+        for idx, name in enumerate(self.feature_names):
+            if self.feature_transforms[name] == "identity":
+                mean[idx] = 0.0
+                std[idx] = 1.0
 
         return MetadataFeatureScaler(
-            feature_names=feature_names,
-            mean=self.mean.astype(np.float32),
-            std=std.astype(np.float32),
+            feature_names=self.feature_names,
+            mean=mean,
+            std=std,
+            feature_transforms=self.feature_transforms,
         )
 
 
@@ -1091,9 +1379,11 @@ def fit_online_metadata_scalers(
     input_ids_key: str = "input_ids",
     attention_mask_key: str = "attention_mask",
     max_batches: Optional[int] = None,
+    embedding_feature_transforms: Optional[Dict[str, str]] = None,
+    token_feature_transforms: Optional[Dict[str, str]] = None,
 ) -> tuple[MetadataFeatureScaler, MetadataFeatureScaler]:
     """
-    Fit StandardScaler statistics for x_emb and x_tok computed online from H_text.
+    Fit feature-aware scaler statistics for x_emb and x_tok computed online from H_text.
 
     The dataloader must yield dictionaries containing:
     - input_ids
@@ -1104,8 +1394,30 @@ def fit_online_metadata_scalers(
 
     encoder = base_model.get_encoder()
 
-    emb_moments = RunningMoments(len(EMBEDDING_FEATURE_NAMES))
-    tok_moments = RunningMoments(len(TOKEN_FEATURE_NAMES))
+    if embedding_feature_transforms is None:
+        embedding_feature_transforms = build_feature_transform_map(
+            EMBEDDING_FEATURE_NAMES,
+            DEFAULT_EMBEDDING_FEATURE_TRANSFORMS,
+            fallback="zscore",
+        )
+
+    if token_feature_transforms is None:
+        token_feature_transforms = build_feature_transform_map(
+            TOKEN_FEATURE_NAMES,
+            DEFAULT_TOKEN_FEATURE_TRANSFORMS,
+            fallback="zscore",
+        )
+
+    emb_moments = RunningMoments(
+        len(EMBEDDING_FEATURE_NAMES),
+        feature_names=EMBEDDING_FEATURE_NAMES,
+        feature_transforms=embedding_feature_transforms,
+    )
+    tok_moments = RunningMoments(
+        len(TOKEN_FEATURE_NAMES),
+        feature_names=TOKEN_FEATURE_NAMES,
+        feature_transforms=token_feature_transforms,
+    )
 
     for batch_idx, batch in enumerate(dataloader):
         if max_batches is not None and batch_idx >= max_batches:
@@ -1128,8 +1440,8 @@ def fit_online_metadata_scalers(
         emb_moments.update(emb_features.detach().cpu().float().numpy())
         tok_moments.update(tok_features.detach().cpu().float().numpy())
 
-    emb_scaler = emb_moments.finalize(EMBEDDING_FEATURE_NAMES)
-    tok_scaler = tok_moments.finalize(TOKEN_FEATURE_NAMES)
+    emb_scaler = emb_moments.finalize()
+    tok_scaler = tok_moments.finalize()
 
     return emb_scaler, tok_scaler
 

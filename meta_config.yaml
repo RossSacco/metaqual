@@ -60,7 +60,7 @@ scorers:
     metadata_dropout: 0.1
     metadata_mlp_hidden_dim: 256
     attention_heads: 8
-    use_meta_ffn: true
+    use_meta_ffn: false
     normalize_metadata_features: false
     unfreeze_last_n_decoder_blocks: 1
     unfreeze_lm_head: true
