@@ -336,6 +336,34 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--decoder_trainable_scope",
+        type=str,
+        choices=["cross_attention", "last_n_blocks", "full_decoder"],
+        default="last_n_blocks",
+        help=(
+            "Which part of the decoder to train. "
+            "'cross_attention' trains only decoder cross-attention layers. "
+            "'last_n_blocks' trains decoder cross-attention plus the last N decoder blocks. "
+            "'full_decoder' trains the whole decoder stack."
+        ),
+    )
+
+    parser.add_argument(
+        "--unfreeze_full_decoder",
+        action="store_true",
+        help="Shortcut for --decoder_trainable_scope full_decoder.",
+    )
+
+    parser.add_argument(
+        "--unfreeze_shared_embeddings",
+        action="store_true",
+        help=(
+            "When using full_decoder, also train T5 shared input embeddings. "
+            "By default they stay frozen because they are shared with the encoder."
+        ),
+    )
+
+    parser.add_argument(
         "--no_unfreeze_lm_head",
         action="store_true",
         help="Keep the LM head frozen. By default it is trainable.",
@@ -757,9 +785,15 @@ def main() -> None:
         and not bool(args.no_normalize_metadata_features)
     )
 
+    decoder_trainable_scope = (
+        "full_decoder" if bool(args.unfreeze_full_decoder) else args.decoder_trainable_scope
+    )
+
     LOGGER.info("Creo modello MetadataEnrichedQualT5...")
     LOGGER.info("metadata_dropout=%s", args.metadata_dropout)
     LOGGER.info("metadata_projection_type=%s", args.metadata_projection_type)
+    LOGGER.info("decoder_trainable_scope=%s", decoder_trainable_scope)
+    LOGGER.info("unfreeze_shared_embeddings=%s", args.unfreeze_shared_embeddings)
     LOGGER.info("normalize_metadata_features=%s", normalize_metadata_features)
     LOGGER.info("metadata_fusion_mode=%s", args.metadata_fusion_mode)
     LOGGER.info("embedding_feature_scaler_path=%s", embedding_scaler_path)
@@ -782,6 +816,8 @@ def main() -> None:
         normalize_metadata_features=normalize_metadata_features,
         unfreeze_last_n_decoder_blocks=args.unfreeze_last_n_decoder_blocks,
         unfreeze_lm_head=not args.no_unfreeze_lm_head,
+        decoder_trainable_scope=decoder_trainable_scope,
+        unfreeze_shared_embeddings=args.unfreeze_shared_embeddings,
         metadata_fusion_mode=args.metadata_fusion_mode,
         lexical_feature_scaler_path=None,
         embedding_feature_scaler_path=embedding_scaler_path,
@@ -918,6 +954,9 @@ def main() -> None:
         "normalize_metadata_features": normalize_metadata_features,
         "unfreeze_last_n_decoder_blocks": args.unfreeze_last_n_decoder_blocks,
         "unfreeze_lm_head": not args.no_unfreeze_lm_head,
+        "decoder_trainable_scope": decoder_trainable_scope,
+        "unfreeze_full_decoder": bool(args.unfreeze_full_decoder),
+        "unfreeze_shared_embeddings": bool(args.unfreeze_shared_embeddings),
         "metadata_fusion_mode": args.metadata_fusion_mode,
         "metadata_normalization_mode": args.metadata_normalization_mode,
         "lexical_feature_transforms": lexical_feature_transforms,
@@ -1002,7 +1041,7 @@ nohup python -u -m metaqual.models.train_metadata_qualt5 \
   --metadata_projection_type linear \
   --metadata_fusion_mode concat_tokens \
   --metadata_normalization_mode feature_aware \
-  --unfreeze_last_n_decoder_blocks 1 \
+  --decoder_trainable_scope full_decoder \
   --max_scaler_examples 500000 \
   --max_online_scaler_examples 100000 \
   --online_scaler_batch_size 16 \

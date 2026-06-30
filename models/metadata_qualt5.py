@@ -784,6 +784,12 @@ class MetadataEnrichedQualT5(nn.Module):
         "meta_prefix",
     }
 
+    VALID_DECODER_TRAINABLE_SCOPES = {
+        "cross_attention",
+        "last_n_blocks",
+        "full_decoder",
+    }
+
     def __init__(
         self,
         model_name_or_path: str,
@@ -800,6 +806,8 @@ class MetadataEnrichedQualT5(nn.Module):
         normalize_metadata_features: bool = False,
         unfreeze_last_n_decoder_blocks: int = 1,
         unfreeze_lm_head: bool = True,
+        decoder_trainable_scope: str = "last_n_blocks",
+        unfreeze_shared_embeddings: bool = False,
         metadata_fusion_mode: str = "pooled_concat_projection",
         lexical_feature_scaler_path: Optional[str | Path] = None,
         embedding_feature_scaler_path: Optional[str | Path] = None,
@@ -811,6 +819,14 @@ class MetadataEnrichedQualT5(nn.Module):
             raise ValueError(
                 f"metadata_fusion_mode must be one of {sorted(self.VALID_FUSION_MODES)}, "
                 f"got {metadata_fusion_mode}"
+            )
+
+        decoder_trainable_scope = str(decoder_trainable_scope)
+        if decoder_trainable_scope not in self.VALID_DECODER_TRAINABLE_SCOPES:
+            raise ValueError(
+                "decoder_trainable_scope must be one of "
+                f"{sorted(self.VALID_DECODER_TRAINABLE_SCOPES)}, "
+                f"got {decoder_trainable_scope}"
             )
 
         self.base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name_or_path)
@@ -826,6 +842,8 @@ class MetadataEnrichedQualT5(nn.Module):
         self.metadata_projection_type = str(metadata_projection_type)
         self.unfreeze_last_n_decoder_blocks = int(unfreeze_last_n_decoder_blocks)
         self.unfreeze_lm_head_flag = bool(unfreeze_lm_head)
+        self.decoder_trainable_scope = decoder_trainable_scope
+        self.unfreeze_shared_embeddings = bool(unfreeze_shared_embeddings)
         self.metadata_fusion_mode = metadata_fusion_mode
 
         self.lexical_feature_scaler_path = (
@@ -909,10 +927,102 @@ class MetadataEnrichedQualT5(nn.Module):
         # Used only by metadata_fusion_mode="meta_prefix".
         self.meta_prefix_ln = nn.LayerNorm(self.d_model)
 
-        self.freeze_all_base_model_except_decoder_cross_attention(
+        self.configure_trainable_parameters(
+            decoder_trainable_scope=self.decoder_trainable_scope,
             unfreeze_last_n_decoder_blocks=self.unfreeze_last_n_decoder_blocks,
             unfreeze_lm_head=self.unfreeze_lm_head_flag,
+            unfreeze_shared_embeddings=self.unfreeze_shared_embeddings,
         )
+
+    def configure_trainable_parameters(
+        self,
+        *,
+        decoder_trainable_scope: str = "last_n_blocks",
+        unfreeze_last_n_decoder_blocks: int = 1,
+        unfreeze_lm_head: bool = True,
+        unfreeze_shared_embeddings: bool = False,
+    ) -> None:
+        """
+        Freezes the T5 backbone, then enables one of three decoder training scopes:
+
+        - cross_attention:
+            train only decoder cross-attention layers in all decoder blocks.
+        - last_n_blocks:
+            train decoder cross-attention layers in all blocks plus the last N
+            decoder blocks.
+        - full_decoder:
+            train the whole decoder stack. By default, T5 shared embeddings are
+            kept frozen because they are shared with the frozen encoder; pass
+            unfreeze_shared_embeddings=True to train them too.
+        """
+        decoder_trainable_scope = str(decoder_trainable_scope)
+        unfreeze_last_n_decoder_blocks = int(unfreeze_last_n_decoder_blocks)
+
+        if decoder_trainable_scope not in self.VALID_DECODER_TRAINABLE_SCOPES:
+            raise ValueError(
+                "decoder_trainable_scope must be one of "
+                f"{sorted(self.VALID_DECODER_TRAINABLE_SCOPES)}, "
+                f"got {decoder_trainable_scope}"
+            )
+
+        if unfreeze_last_n_decoder_blocks < 0:
+            raise ValueError(
+                "unfreeze_last_n_decoder_blocks must be >= 0, "
+                f"got {unfreeze_last_n_decoder_blocks}"
+            )
+
+        # Start from a fully frozen T5 backbone.
+        for param in self.base_model.parameters():
+            param.requires_grad = False
+
+        decoder = self.base_model.get_decoder()
+
+        if decoder_trainable_scope == "cross_attention":
+            # In T5 decoder blocks, layer.1 is the encoder-decoder cross-attention.
+            for name, param in self.base_model.named_parameters():
+                if "decoder.block" in name and ".layer.1." in name:
+                    param.requires_grad = True
+
+        elif decoder_trainable_scope == "last_n_blocks":
+            # Cross-attention remains trainable in all decoder blocks.
+            for name, param in self.base_model.named_parameters():
+                if "decoder.block" in name and ".layer.1." in name:
+                    param.requires_grad = True
+
+            if hasattr(decoder, "block") and len(decoder.block) > 0:
+                n_blocks = len(decoder.block)
+                n_to_unfreeze = min(unfreeze_last_n_decoder_blocks, n_blocks)
+
+                if n_to_unfreeze > 0:
+                    for block in decoder.block[-n_to_unfreeze:]:
+                        for param in block.parameters():
+                            param.requires_grad = True
+
+        elif decoder_trainable_scope == "full_decoder":
+            # Train the full decoder stack: self-attention, cross-attention,
+            # feed-forward layers, layer norms, and optionally shared embeddings.
+            for param in decoder.parameters():
+                param.requires_grad = True
+
+            if not unfreeze_shared_embeddings:
+                # T5 uses shared input embeddings. Freezing them keeps the encoder
+                # input embedding space fixed even when the decoder is fully trainable.
+                if hasattr(decoder, "embed_tokens"):
+                    for param in decoder.embed_tokens.parameters():
+                        param.requires_grad = False
+
+                if hasattr(self.base_model, "shared"):
+                    for param in self.base_model.shared.parameters():
+                        param.requires_grad = False
+
+                encoder = self.base_model.get_encoder()
+                if hasattr(encoder, "embed_tokens"):
+                    for param in encoder.embed_tokens.parameters():
+                        param.requires_grad = False
+
+        if unfreeze_lm_head and hasattr(self.base_model, "lm_head"):
+            for param in self.base_model.lm_head.parameters():
+                param.requires_grad = True
 
     def freeze_all_base_model_except_decoder_cross_attention(
         self,
@@ -921,41 +1031,15 @@ class MetadataEnrichedQualT5(nn.Module):
         unfreeze_lm_head: bool = True,
     ) -> None:
         """
-        Freezes the entire T5 backbone, then unfreezes:
-
-        1. decoder cross-attention layers in all decoder blocks;
-        2. optionally, the last N decoder blocks;
-        3. optionally, the LM head.
+        Backward-compatible wrapper for the previous training setup:
+        decoder cross-attention in all blocks + optionally the last N decoder blocks.
         """
-        unfreeze_last_n_decoder_blocks = int(unfreeze_last_n_decoder_blocks)
-
-        if unfreeze_last_n_decoder_blocks < 0:
-            raise ValueError(
-                "unfreeze_last_n_decoder_blocks must be >= 0, "
-                f"got {unfreeze_last_n_decoder_blocks}"
-            )
-
-        for param in self.base_model.parameters():
-            param.requires_grad = False
-
-        for name, param in self.base_model.named_parameters():
-            if "decoder.block" in name and ".layer.1." in name:
-                param.requires_grad = True
-
-        decoder = self.base_model.get_decoder()
-
-        if hasattr(decoder, "block") and len(decoder.block) > 0:
-            n_blocks = len(decoder.block)
-            n_to_unfreeze = min(unfreeze_last_n_decoder_blocks, n_blocks)
-
-            if n_to_unfreeze > 0:
-                for block in decoder.block[-n_to_unfreeze:]:
-                    for param in block.parameters():
-                        param.requires_grad = True
-
-        if unfreeze_lm_head and hasattr(self.base_model, "lm_head"):
-            for param in self.base_model.lm_head.parameters():
-                param.requires_grad = True
+        self.configure_trainable_parameters(
+            decoder_trainable_scope="last_n_blocks",
+            unfreeze_last_n_decoder_blocks=unfreeze_last_n_decoder_blocks,
+            unfreeze_lm_head=unfreeze_lm_head,
+            unfreeze_shared_embeddings=False,
+        )
 
     def get_trainable_parameter_stats(self) -> Dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
@@ -1253,6 +1337,8 @@ class MetadataEnrichedQualT5(nn.Module):
             "metadata_projection_type": self.metadata_projection_type,
             "unfreeze_last_n_decoder_blocks": self.unfreeze_last_n_decoder_blocks,
             "unfreeze_lm_head": self.unfreeze_lm_head_flag,
+            "decoder_trainable_scope": self.decoder_trainable_scope,
+            "unfreeze_shared_embeddings": self.unfreeze_shared_embeddings,
             "metadata_fusion_mode": self.metadata_fusion_mode,
             "lexical_feature_scaler_path": self.lexical_feature_scaler_path,
             "embedding_feature_scaler_path": self.embedding_feature_scaler_path,
