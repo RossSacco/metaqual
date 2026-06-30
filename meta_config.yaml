@@ -10,17 +10,18 @@ dataset:
 experiment:
   # Nome logico dello scorer, cioè quello usato dal tuo codice in get_scorer/base_scorer.
   scorer: "metadata_qualt5"
-
+  index_scorer_name: "metadata_qualt5_CONCAT"
   # Nome specifico dell'esperimento/cache.
   # Verrà usato per nominare la cartella degli indici.
   scorer_output_name: "metadata_qualt5_CONCAT"
 
+  
   # Cache effettiva da usare.
   # Lo script cercherà:
   # /data/data-sacco/cache/metadata_qualt5_msmarco_passage_CONCAT.cache
   cache_file: "metadata_qualt5_msmarco_passage_CONCAT.cache"
 
-  threshold: 0.15
+  threshold: 0.60
   restart_cache: false
   retriever: "all"
 

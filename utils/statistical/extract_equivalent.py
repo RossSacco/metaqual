@@ -1,8 +1,14 @@
 import os
 import pandas as pd
 
-BASE_DIR = "metaqual/utils/statistical/results_sts2"
-INPUT_CSV = os.path.join(BASE_DIR, "tost_pruning_noninferiority_5pct_full_vs_pruned.csv")
+
+BASE_DIR = "metaqual/utils/statistical/results_sts3"
+
+INPUT_CSV = os.path.join(
+    BASE_DIR,
+    "tost_pruning_noninferiority_5pct_full_vs_pruned.csv"
+)
+
 
 if __name__ == "__main__":
     df = pd.read_csv(INPUT_CSV)
@@ -12,6 +18,7 @@ if __name__ == "__main__":
 
     plot_ready = eq[[
         "scorer",
+        "qrels_variant",
         "threshold",
         "pruning_percent",
         "pipeline",
@@ -26,13 +33,21 @@ if __name__ == "__main__":
 
     plot_ready["config_id"] = (
         plot_ready["scorer"].astype(str) + " | " +
+        plot_ready["qrels_variant"].astype(str) + " | " +
         plot_ready["pipeline"].astype(str) + " | " +
         plot_ready["metric"].astype(str) + " | thr=" +
         plot_ready["threshold"].astype(str)
     )
 
-    eq_csv = os.path.join(BASE_DIR, "equivalent_configs_only_5pct.csv")
-    plot_csv = os.path.join(BASE_DIR, "equivalent_configs_plot_ready_5pct.csv")
+    eq_csv = os.path.join(
+        BASE_DIR,
+        "equivalent_configs_only_5pct.csv"
+    )
+
+    plot_csv = os.path.join(
+        BASE_DIR,
+        "equivalent_configs_plot_ready_5pct.csv"
+    )
 
     eq.to_csv(eq_csv, index=False)
     plot_ready.to_csv(plot_csv, index=False)
@@ -40,3 +55,6 @@ if __name__ == "__main__":
     print("Salvati:")
     print(eq_csv)
     print(plot_csv)
+
+    print("\nConfigurazioni equivalenti trovate:")
+    print(plot_ready)

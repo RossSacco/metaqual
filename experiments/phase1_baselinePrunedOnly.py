@@ -55,8 +55,7 @@ def get_index_scorer_name(config: Dict[str, Any], scorer_name: str) -> str:
     Allora lo script userà:
         /data/data-sacco/indexes/metadata_qualt5_MP_pruned_0.15
 
-    ma nei risultati continuerà a salvare lo scorer logico:
-        metadata_qualt5
+    
     """
     exp_cfg = config.get("experiment", {})
 

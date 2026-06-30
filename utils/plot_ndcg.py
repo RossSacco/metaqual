@@ -1,25 +1,209 @@
 import os
+import re
 import glob
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
+
 BASE1 = "results2"
-RES = "metaqual/utils/statistical/results_sts2"
+RES = "metaqual/utils/statistical/results_sts3"
 
 # Se vuoi plottare sempre RR@10, lascia True.
-# Se invece vuoi mantenere la logica originale:
+# Se invece vuoi mantenere la logica:
 # - dev.small -> RR@10
 # - test-2019/test-2020 -> nDCG@10
 # metti False.
 FORCE_RR10 = False
 
 
+def parse_compare_filename(path):
+    """
+    Parsing dei file nel formato:
+
+        compare_all_<scorer_name>_<qrels_variant>_<threshold>.csv
+
+    Esempi:
+        compare_all_finetuned_qualt5_test-2019_test-2020_0.6.csv
+        compare_all_metadata_qualt5_mp_test-2019_test-2020_0.6.csv
+        compare_all_metadata_qualt5_concat_test-2019_test-2020_0.6.csv
+        compare_all_metadata_qualt5_pooledconcat_test-2019_test-2020_0.6.csv
+
+    Output:
+        scorer_name
+        qrels_variant
+        threshold
+    """
+
+    name = os.path.basename(path)
+
+    if not name.startswith("compare_all_") or not name.endswith(".csv"):
+        raise ValueError(f"Filename non riconosciuto: {path}")
+
+    stem = name[len("compare_all_"):-len(".csv")]
+
+    try:
+        prefix, threshold_str = stem.rsplit("_", 1)
+        threshold = float(threshold_str)
+    except ValueError:
+        raise ValueError(f"Impossibile estrarre threshold dal filename: {path}")
+
+    # qrels riconosciuti:
+    # test-2019
+    # test-2020
+    # test-2019_test-2020
+    # dev.small / dev_small
+    match = re.search(
+        r"_(test-\d{4}(?:_test-\d{4})*|dev\.small|dev_small)$",
+        prefix
+    )
+
+    if match:
+        qrels_variant = match.group(1).replace("dev_small", "dev.small")
+        scorer_name = prefix[:match.start()]
+    else:
+        qrels_variant = None
+        scorer_name = prefix
+
+    return scorer_name, qrels_variant, threshold
+
+
+def is_wanted_scorer(scorer):
+    """
+    Teniamo:
+    - finetuned_qualt5
+    - tutte le varianti metadata_qualt5*
+    """
+    scorer = str(scorer)
+    return scorer == "finetuned_qualt5" or scorer.startswith("metadata_qualt5")
+
+
+def fix_legacy_metadata_names(df):
+    """
+    Serve per retrocompatibilità.
+
+    Se in vecchi CSV TOST hai righe del tipo:
+        scorer = metadata_qualt5
+        qrels_variant = mp_test-2019_test-2020
+
+    le converte in:
+        scorer = metadata_qualt5_mp
+        qrels_variant = test-2019_test-2020
+
+    Stessa cosa per concat e pooledconcat.
+    """
+
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    if "qrels_variant" not in df.columns:
+        df["qrels_variant"] = None
+
+    known_variants = [
+        "pooledconcat",
+        "pooled_concat",
+        "concat",
+        "mp",
+        "POOLEDCONCAT",
+        "POOLED_CONCAT",
+        "CONCAT",
+        "MP",
+    ]
+
+    for idx, row in df.iterrows():
+        scorer = str(row.get("scorer", ""))
+        qrels_variant = row.get("qrels_variant", None)
+
+        if scorer != "metadata_qualt5":
+            continue
+
+        if pd.isna(qrels_variant):
+            continue
+
+        qrels_str = str(qrels_variant)
+
+        for variant in known_variants:
+            prefix = variant + "_"
+
+            if qrels_str.startswith(prefix):
+                clean_variant = variant.lower()
+                clean_variant = clean_variant.replace("pooled_concat", "pooledconcat")
+
+                df.at[idx, "scorer"] = f"metadata_qualt5_{clean_variant}"
+                df.at[idx, "qrels_variant"] = qrels_str[len(prefix):]
+                break
+
+    return df
+
+
+def scorer_label(scorer):
+    labels = {
+        "finetuned_qualt5": "Finetuned QualT5",
+        "metadata_qualt5": "Metadata QualT5",
+        "metadata_qualt5_mp": "Metadata QualT5 MP",
+        "metadata_qualt5_concat": "Metadata QualT5 CONCAT",
+        "metadata_qualt5_pooledconcat": "Metadata QualT5 POOLEDCONCAT",
+    }
+
+    if scorer in labels:
+        return labels[scorer]
+
+    if scorer.startswith("metadata_qualt5_"):
+        suffix = scorer.replace("metadata_qualt5_", "")
+        return "Metadata QualT5 " + suffix.upper()
+
+    return scorer
+
+
+def build_scorer_styles(scorer_order):
+    """
+    Stili per distinguere finetuned e le diverse varianti metadata.
+    """
+
+    colors = [
+        "tab:blue",
+        "tab:orange",
+        "tab:green",
+        "tab:red",
+        "tab:purple",
+        "tab:brown",
+        "tab:pink",
+        "tab:gray",
+    ]
+
+    linestyles = [
+        "-",
+        "-",
+        "-",
+        "-",
+        "--",
+        "--",
+        "-.",
+        ":",
+    ]
+
+    styles = {}
+
+    for i, scorer in enumerate(scorer_order):
+        styles[scorer] = {
+            "color": colors[i % len(colors)],
+            "linestyle": linestyles[i % len(linestyles)],
+            "dashes": None,
+        }
+
+    return styles
+
+
 if __name__ == "__main__":
     os.makedirs(RES, exist_ok=True)
 
     summary_files = sorted(glob.glob(os.path.join(BASE1, "compare_all_*.csv")))
+
+    # Teniamo solo i summary csv, non i per-query e non i timings.
     summary_files = [
         f for f in summary_files
         if "_perquery_" not in os.path.basename(f)
@@ -34,51 +218,26 @@ if __name__ == "__main__":
     if not os.path.exists(tost_path):
         raise FileNotFoundError(
             f"File TOST non trovato: {tost_path}\n"
-            "Esegui prima TOST.py aggiornato anche per metadata_qualt5."
+            "Esegui prima lo script TOST aggiornato, quello che riconosce "
+            "metadata_qualt5_mp / metadata_qualt5_concat / metadata_qualt5_pooledconcat."
         )
 
     tost_df = pd.read_csv(tost_path)
+    tost_df = fix_legacy_metadata_names(tost_df)
 
     rows = []
-
-    # Manteniamo SOLO questi due scorer.
-    # Nota: nel tuo codice lo scorer si chiama finetuned_qualt5,
-    # anche se a parole lo chiami qualt5_finetuned.
-    KNOWN_SCORERS = [
-        "metadata_qualt5",
-        "finetuned_qualt5",
-    ]
 
     for f in summary_files:
         name = os.path.basename(f)
 
-        if not name.startswith("compare_all_") or not name.endswith(".csv"):
-            continue
-
-        stem = name[len("compare_all_"):-len(".csv")]
-
         try:
-            prefix, threshold_str = stem.rsplit("_", 1)
-            threshold = float(threshold_str)
+            scorer, qrels_variant, threshold = parse_compare_filename(f)
         except ValueError:
             print(f"[WARNING] Nome file non compatibile, salto: {name}")
             continue
 
-        scorer = None
-        qrels_variant = None
-
-        for candidate in sorted(KNOWN_SCORERS, key=len, reverse=True):
-            if prefix == candidate:
-                scorer = candidate
-                qrels_variant = None
-                break
-            elif prefix.startswith(candidate + "_"):
-                scorer = candidate
-                qrels_variant = prefix[len(candidate) + 1:]
-                break
-
-        if scorer is None:
-            # Qui vengono scartati itn, tasb, cdd, perplexity, ecc.
+        # Teniamo finetuned_qualt5 + tutte le varianti metadata_qualt5*
+        if not is_wanted_scorer(scorer):
             continue
 
         df = pd.read_csv(f)
@@ -111,16 +270,20 @@ if __name__ == "__main__":
 
     if perf_df.empty:
         raise ValueError(
-            "Nessun risultato trovato per finetuned_qualt5 o metadata_qualt5.\n"
+            "Nessun risultato trovato per finetuned_qualt5 o metadata_qualt5*.\n"
             "Controlla che in results2 esistano file tipo:\n"
-            "  compare_all_finetuned_qualt5_...csv\n"
-            "  compare_all_metadata_qualt5_...csv"
+            "  compare_all_finetuned_qualt5_test-2019_test-2020_0.6.csv\n"
+            "  compare_all_metadata_qualt5_mp_test-2019_test-2020_0.6.csv\n"
+            "  compare_all_metadata_qualt5_concat_test-2019_test-2020_0.6.csv\n"
+            "  compare_all_metadata_qualt5_pooledconcat_test-2019_test-2020_0.6.csv"
         )
 
     # TOST: serve per disegnare i pallini delle configurazioni equivalenti.
     tost_keep = tost_df.rename(
         columns={"passes_pruning_tost_p_lt_0.05": "equivalent"}
-    )[[
+    ).copy()
+
+    required_tost_cols = [
         "scorer",
         "qrels_variant",
         "threshold",
@@ -128,10 +291,19 @@ if __name__ == "__main__":
         "metric",
         "mean_full",
         "equivalent",
-    ]].copy()
+    ]
 
-    # Teniamo solo i due scorer anche dal file TOST.
-    tost_keep = tost_keep[tost_keep["scorer"].isin(KNOWN_SCORERS)].copy()
+    missing_cols = [c for c in required_tost_cols if c not in tost_keep.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Nel file TOST mancano queste colonne: {missing_cols}\n"
+            "Rigenera il file TOST con lo script aggiornato."
+        )
+
+    tost_keep = tost_keep[required_tost_cols].copy()
+
+    # Teniamo solo finetuned_qualt5 + metadata_qualt5*
+    tost_keep = tost_keep[tost_keep["scorer"].apply(is_wanted_scorer)].copy()
 
     long_rows = []
 
@@ -163,34 +335,38 @@ if __name__ == "__main__":
 
     plot_ready_out = os.path.join(
         RES,
-        "plot_ready_pruning_finetuned_vs_metadata_qualt5.csv"
+        "plot_ready_pruning_finetuned_vs_all_metadata_qualt5.csv"
     )
+
     plot_df.to_csv(plot_ready_out, index=False)
 
-    scorer_order = [
-        "finetuned_qualt5",
-        "metadata_qualt5",
-    ]
+    # Ordine: prima baseline finetuned, poi tutte le varianti metadata trovate nei dati.
+    available_scorers = sorted(plot_df["scorer"].dropna().unique().tolist())
+
+    metadata_scorers = sorted([
+        s for s in available_scorers
+        if str(s).startswith("metadata_qualt5")
+    ])
+
+    scorer_order = []
+
+    if "finetuned_qualt5" in available_scorers:
+        scorer_order.append("finetuned_qualt5")
+
+    scorer_order.extend(metadata_scorers)
 
     pipelines = ["BM25", "SPLADE", "TAS-B"]
 
     scorer_labels = {
-        "finetuned_qualt5": "Finetuned QualT5",
-        "metadata_qualt5": "Metadata QualT5",
+        scorer: scorer_label(scorer)
+        for scorer in scorer_order
     }
 
-    scorer_styles = {
-        "finetuned_qualt5": {
-            "color": "tab:blue",
-            "linestyle": "-",
-            "dashes": None,
-        },
-        "metadata_qualt5": {
-            "color": "tab:orange",
-            "linestyle": "-",
-            "dashes": None,
-        },
-    }
+    scorer_styles = build_scorer_styles(scorer_order)
+
+    print("\n[INFO] Scorer che verranno plottati:")
+    for scorer in scorer_order:
+        print(f"  - {scorer} -> {scorer_labels[scorer]}")
 
     for qrels_val in sorted(plot_df["qrels_variant"].dropna().unique()):
 
@@ -222,15 +398,17 @@ if __name__ == "__main__":
             if sub.empty:
                 continue
 
-            plt.figure(figsize=(8.6, 5.4))
+            plt.figure(figsize=(9.6, 5.8))
             ax = plt.gca()
 
             # Linea baseline Full.
             # Prendiamo mean_full dal primo scorer disponibile.
             first_nonempty = None
+
             for scorer in scorer_order:
                 s = sub[sub["scorer"] == scorer].sort_values("pruning_percent")
-                if not s.empty and pd.notna(s["mean_full"].iloc[0]):
+
+                if not s.empty and "mean_full" in s.columns and pd.notna(s["mean_full"].iloc[0]):
                     first_nonempty = s
                     break
 
@@ -248,16 +426,23 @@ if __name__ == "__main__":
                 full_line.set_dashes((6, 3))
 
             # Linee pruned.
+            present_scorers = []
+
             for scorer in scorer_order:
                 s = sub[sub["scorer"] == scorer].sort_values("pruning_percent")
 
                 if s.empty:
                     continue
 
-                if pd.notna(s["mean_full"].iloc[0]):
+                present_scorers.append(scorer)
+
+                # Punto iniziale della linea = valore Full.
+                if "mean_full" in s.columns and pd.notna(s["mean_full"].iloc[0]):
                     full_val = float(s["mean_full"].iloc[0])
+                elif first_nonempty is not None:
+                    full_val = float(first_nonempty["mean_full"].iloc[0])
                 else:
-                    full_val = s["value"].max()
+                    full_val = float(s["value"].max())
 
                 x_vals = [0.0] + s["pruning_percent"].tolist()
                 y_vals = [full_val] + s["value"].tolist()
@@ -317,8 +502,9 @@ if __name__ == "__main__":
             h_full.set_dashes((6, 3))
             legend_handles.append(h_full)
 
-            for scorer in scorer_order:
+            for scorer in present_scorers:
                 style = scorer_styles[scorer]
+
                 h = Line2D(
                     [0],
                     [0],
@@ -355,6 +541,8 @@ if __name__ == "__main__":
                 handletextpad=0.8,
             )
 
+            ax.grid(True, alpha=0.25)
+
             plt.tight_layout()
 
             metric_clean = METRIC_TO_PLOT.lower().replace("@", "")
@@ -363,7 +551,7 @@ if __name__ == "__main__":
 
             out = os.path.join(
                 RES,
-                f"{metric_clean}_pruning_plot_{pipeline_clean}_{qrels_clean}_finetuned_vs_metadata.png"
+                f"{metric_clean}_pruning_plot_{pipeline_clean}_{qrels_clean}_finetuned_vs_all_metadata.png"
             )
 
             plt.savefig(out, dpi=220, bbox_inches="tight")
