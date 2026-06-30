@@ -444,6 +444,7 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
         allow_missing_metadata=False,
         metadata_dropout=None,
         metadata_mlp_hidden_dim=None,
+        metadata_projection_type=None,
         attention_heads=None,
         use_meta_ffn=None,
         metadata_fusion_mode=None,
@@ -606,6 +607,13 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             metadata_mlp_hidden_dim,
         )
 
+        # Backward compatibility: old checkpoints did not store this field and were trained
+        # with the previous two-layer ReLU MLP. New checkpoints should store "linear".
+        metadata_projection_type = self.saved_meta_cfg.get(
+            "metadata_projection_type",
+            metadata_projection_type if metadata_projection_type is not None else "mlp",
+        )
+
         attention_heads = self.saved_meta_cfg.get(
             "attention_heads",
             attention_heads if attention_heads is not None else 8,
@@ -647,6 +655,7 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             f"scoring_mode={scoring_mode} | "
             f"metadata_dropout={metadata_dropout} | "
             f"metadata_mlp_hidden_dim={metadata_mlp_hidden_dim} | "
+            f"metadata_projection_type={metadata_projection_type} | "
             f"attention_heads={attention_heads} | "
             f"use_meta_ffn={use_meta_ffn} | "
             f"metadata_fusion_mode={metadata_fusion_mode} | "
@@ -663,6 +672,7 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             scoring_mode=scoring_mode,
             metadata_mlp_hidden_dim=metadata_mlp_hidden_dim,
             metadata_dropout=float(metadata_dropout),
+            metadata_projection_type=str(metadata_projection_type),
             attention_heads=int(attention_heads),
             use_meta_ffn=bool(use_meta_ffn),
             normalize_metadata_features=bool(normalize_metadata_features),
@@ -906,6 +916,7 @@ def get_scorer(nome_scorer, **kwargs):
 
             metadata_dropout=kwargs.get("metadata_dropout"),
             metadata_mlp_hidden_dim=kwargs.get("metadata_mlp_hidden_dim"),
+            metadata_projection_type=kwargs.get("metadata_projection_type"),
             attention_heads=kwargs.get("attention_heads"),
             use_meta_ffn=kwargs.get("use_meta_ffn"),
 

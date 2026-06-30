@@ -294,6 +294,17 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--metadata_dropout", type=float, default=0.0)
     parser.add_argument("--metadata_mlp_hidden_dim", type=int, default=None)
+    parser.add_argument(
+        "--metadata_projection_type",
+        type=str,
+        choices=["linear", "mlp"],
+        default="linear",
+        help=(
+            "How each metadata group is projected into the T5 hidden space. "
+            "'linear' uses a single Linear(in_dim, d_model) without activation. "
+            "'mlp' keeps the previous two-layer ReLU MLP for backward-compatible experiments."
+        ),
+    )
     parser.add_argument("--attention_heads", type=int, default=8)
     parser.add_argument("--disable_meta_ffn", action="store_true")
 
@@ -748,6 +759,7 @@ def main() -> None:
 
     LOGGER.info("Creo modello MetadataEnrichedQualT5...")
     LOGGER.info("metadata_dropout=%s", args.metadata_dropout)
+    LOGGER.info("metadata_projection_type=%s", args.metadata_projection_type)
     LOGGER.info("normalize_metadata_features=%s", normalize_metadata_features)
     LOGGER.info("metadata_fusion_mode=%s", args.metadata_fusion_mode)
     LOGGER.info("embedding_feature_scaler_path=%s", embedding_scaler_path)
@@ -764,6 +776,7 @@ def main() -> None:
         scoring_mode=args.scoring_mode,
         metadata_mlp_hidden_dim=args.metadata_mlp_hidden_dim,
         metadata_dropout=args.metadata_dropout,
+        metadata_projection_type=args.metadata_projection_type,
         attention_heads=args.attention_heads,
         use_meta_ffn=not args.disable_meta_ffn,
         normalize_metadata_features=normalize_metadata_features,
@@ -899,6 +912,7 @@ def main() -> None:
         "scoring_mode": args.scoring_mode,
         "metadata_dropout": args.metadata_dropout,
         "metadata_mlp_hidden_dim": args.metadata_mlp_hidden_dim,
+        "metadata_projection_type": args.metadata_projection_type,
         "attention_heads": args.attention_heads,
         "use_meta_ffn": not args.disable_meta_ffn,
         "normalize_metadata_features": normalize_metadata_features,
@@ -985,7 +999,7 @@ nohup python -u -m metaqual.models.train_metadata_qualt5 \
   --save_total_limit 3 \
   --logging_steps 50 \
   --metadata_dropout 0.1 \
-  --metadata_mlp_hidden_dim 256 \
+  --metadata_projection_type linear \
   --metadata_fusion_mode concat_tokens \
   --metadata_normalization_mode feature_aware \
   --unfreeze_last_n_decoder_blocks 1 \

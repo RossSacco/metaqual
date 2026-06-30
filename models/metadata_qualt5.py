@@ -602,7 +602,12 @@ class LexicalMetadataStore:
 
 class GroupWiseMetadataEncoder(nn.Module):
     """
-    Encodes each metadata group with a dedicated MLP.
+    Encodes each metadata group into the T5 hidden space.
+
+    projection_type:
+    - "linear": simple projection Linear(in_dim, d_model), without activation;
+    - "mlp": backward-compatible two-layer projection
+             Linear(in_dim, hidden_dim) -> ReLU -> Linear(hidden_dim, d_model).
 
     Expected input:
     - lexical_features:   [B, lexical_dim]
@@ -613,6 +618,8 @@ class GroupWiseMetadataEncoder(nn.Module):
     - z_meta: [B, 3, d_model]
     """
 
+    VALID_PROJECTION_TYPES = {"linear", "mlp"}
+
     def __init__(
         self,
         lexical_dim: int,
@@ -622,11 +629,19 @@ class GroupWiseMetadataEncoder(nn.Module):
         hidden_dim: Optional[int] = None,
         dropout: float = 0.0,
         normalize_inputs: bool = False,
+        projection_type: str = "linear",
     ):
         super().__init__()
 
+        if projection_type not in self.VALID_PROJECTION_TYPES:
+            raise ValueError(
+                f"projection_type must be one of {sorted(self.VALID_PROJECTION_TYPES)}, "
+                f"got {projection_type!r}"
+            )
+
         inner = hidden_dim if hidden_dim is not None else d_model
         self.normalize_inputs = bool(normalize_inputs)
+        self.projection_type = projection_type
 
         if self.normalize_inputs:
             self.lexical_norm = nn.LayerNorm(lexical_dim)
@@ -637,28 +652,54 @@ class GroupWiseMetadataEncoder(nn.Module):
             self.embedding_norm = nn.Identity()
             self.token_norm = nn.Identity()
 
-        self.lexical_mlp = self._build_mlp(lexical_dim, inner, d_model, dropout)
-        self.embedding_mlp = self._build_mlp(embedding_dim, inner, d_model, dropout)
-        self.token_mlp = self._build_mlp(token_dim, inner, d_model, dropout)
+        self.lexical_mlp = self._build_projection(
+            lexical_dim,
+            inner,
+            d_model,
+            dropout,
+            projection_type=projection_type,
+        )
+        self.embedding_mlp = self._build_projection(
+            embedding_dim,
+            inner,
+            d_model,
+            dropout,
+            projection_type=projection_type,
+        )
+        self.token_mlp = self._build_projection(
+            token_dim,
+            inner,
+            d_model,
+            dropout,
+            projection_type=projection_type,
+        )
 
     @staticmethod
-    def _build_mlp(
+    def _build_projection(
         in_dim: int,
         hidden_dim: int,
         out_dim: int,
         dropout: float,
-    ) -> nn.Sequential:
-        layers: list[nn.Module] = [
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-        ]
+        *,
+        projection_type: str,
+    ) -> nn.Module:
+        if projection_type == "linear":
+            return nn.Linear(in_dim, out_dim)
 
-        if dropout > 0.0:
-            layers.append(nn.Dropout(dropout))
+        if projection_type == "mlp":
+            layers: list[nn.Module] = [
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(),
+            ]
 
-        layers.append(nn.Linear(hidden_dim, out_dim))
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
 
-        return nn.Sequential(*layers)
+            layers.append(nn.Linear(hidden_dim, out_dim))
+
+            return nn.Sequential(*layers)
+
+        raise ValueError(f"Unsupported projection_type={projection_type!r}")
 
     def forward(
         self,
@@ -753,6 +794,7 @@ class MetadataEnrichedQualT5(nn.Module):
         scoring_mode: str = "true_logprob",
         metadata_mlp_hidden_dim: Optional[int] = None,
         metadata_dropout: float = 0.0,
+        metadata_projection_type: str = "linear",
         attention_heads: int = 8,
         use_meta_ffn: bool = True,
         normalize_metadata_features: bool = False,
@@ -781,6 +823,7 @@ class MetadataEnrichedQualT5(nn.Module):
         self.d_model = int(self.config.d_model)
 
         self.normalize_metadata_features = bool(normalize_metadata_features)
+        self.metadata_projection_type = str(metadata_projection_type)
         self.unfreeze_last_n_decoder_blocks = int(unfreeze_last_n_decoder_blocks)
         self.unfreeze_lm_head_flag = bool(unfreeze_lm_head)
         self.metadata_fusion_mode = metadata_fusion_mode
@@ -824,6 +867,7 @@ class MetadataEnrichedQualT5(nn.Module):
             hidden_dim=metadata_mlp_hidden_dim,
             dropout=metadata_dropout,
             normalize_inputs=self.normalize_metadata_features,
+            projection_type=self.metadata_projection_type,
         )
 
         self.uni_attention = UniAttention(
@@ -1206,6 +1250,7 @@ class MetadataEnrichedQualT5(nn.Module):
             "meta_prefix_ln": self.meta_prefix_ln.state_dict(),
             "use_meta_ffn": self.use_meta_ffn,
             "normalize_metadata_features": self.normalize_metadata_features,
+            "metadata_projection_type": self.metadata_projection_type,
             "unfreeze_last_n_decoder_blocks": self.unfreeze_last_n_decoder_blocks,
             "unfreeze_lm_head": self.unfreeze_lm_head_flag,
             "metadata_fusion_mode": self.metadata_fusion_mode,
