@@ -421,8 +421,9 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
 
     VALID_FUSION_MODES = {
         "concat_tokens",
+        "att_fusion",
         "pooled_concat_projection",
-        "direct_concat_projection",
+        "allmeta_token_projection",
         "meta_prefix",
     }
 

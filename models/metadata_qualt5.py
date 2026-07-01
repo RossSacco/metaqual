@@ -607,7 +607,7 @@ class GroupWiseMetadataEncoder(nn.Module):
     projection_type:
     - "linear": simple projection Linear(in_dim, d_model), without activation;
     - "mlp": backward-compatible two-layer projection
-             Linear(in_dim, hidden_dim) -> ReLU -> Linear(hidden_dim, d_model).
+             Linear(in_dim, hidden_dim) -> GELU -> Linear(hidden_dim, d_model).
 
     Expected input:
     - lexical_features:   [B, lexical_dim]
@@ -689,7 +689,7 @@ class GroupWiseMetadataEncoder(nn.Module):
         if projection_type == "mlp":
             layers: list[nn.Module] = [
                 nn.Linear(in_dim, hidden_dim),
-                nn.ReLU(),
+                nn.GELU(),
             ]
 
             if dropout > 0.0:
@@ -763,14 +763,20 @@ class MetadataEnrichedQualT5(nn.Module):
     - concat_tokens:
         decoder attends to [z_lex ; z_emb ; z_tok ; H_text].
 
+    - att_fusion:
+        decoder attends only to Z_meta_fused, i.e. the metadata-conditioned
+        textual summaries produced by UniAttention and refined by residual/LN
+        and, optionally, the metadata FFN.
+
     - pooled_concat_projection:
         meta_vec = mean(Z_meta_fused)
         metadata_update = MLP([H_text ; repeat(meta_vec)])
         H_fused = LayerNorm(H_text + metadata_update)
 
-    - direct_concat_projection:
-        meta_vec = mean(Z_meta_fused)
-        H_fused = LayerNorm(MLP([H_text ; repeat(meta_vec)]))
+    - allmeta_token_projection:
+        z_all = concat(z_lex, z_emb, z_tok)
+        metadata_update = GELU-MLP([H_text ; repeat(z_all)])
+        H_fused = LayerNorm(H_text + metadata_update)
 
     - meta_prefix:
         meta_vec = mean(Z_meta_fused)
@@ -779,8 +785,9 @@ class MetadataEnrichedQualT5(nn.Module):
 
     VALID_FUSION_MODES = {
         "concat_tokens",
+        "att_fusion",
         "pooled_concat_projection",
-        "direct_concat_projection",
+        "allmeta_token_projection",
         "meta_prefix",
     }
 
@@ -900,7 +907,7 @@ class MetadataEnrichedQualT5(nn.Module):
         if self.use_meta_ffn:
             meta_ffn_layers: list[nn.Module] = [
                 nn.Linear(self.d_model, self.d_model * 4),
-                nn.ReLU(),
+                nn.GELU(),
             ]
 
             if metadata_dropout > 0.0:
@@ -913,7 +920,7 @@ class MetadataEnrichedQualT5(nn.Module):
 
         pooled_projection_layers: list[nn.Module] = [
             nn.Linear(self.d_model * 2, self.d_model),
-            nn.ReLU(),
+            nn.GELU(),
         ]
 
         if metadata_dropout > 0.0:
@@ -923,6 +930,22 @@ class MetadataEnrichedQualT5(nn.Module):
 
         self.pooled_concat_projection = nn.Sequential(*pooled_projection_layers)
         self.pooled_concat_ln = nn.LayerNorm(self.d_model)
+
+        # Used only by metadata_fusion_mode="allmeta_token_projection".
+        # Input is [h_i ; z_lex ; z_emb ; z_tok] -> 4 * d_model.
+        allmeta_hidden_dim = metadata_mlp_hidden_dim if metadata_mlp_hidden_dim is not None else self.d_model
+        allmeta_projection_layers: list[nn.Module] = [
+            nn.Linear(self.d_model * 4, allmeta_hidden_dim),
+            nn.GeLU(),
+        ]
+
+        if metadata_dropout > 0.0:
+            allmeta_projection_layers.append(nn.Dropout(metadata_dropout))
+
+        allmeta_projection_layers.append(nn.Linear(allmeta_hidden_dim, self.d_model))
+
+        self.allmeta_token_projection = nn.Sequential(*allmeta_projection_layers)
+        self.allmeta_token_projection_ln = nn.LayerNorm(self.d_model)
 
         # Used only by metadata_fusion_mode="meta_prefix".
         self.meta_prefix_ln = nn.LayerNorm(self.d_model)
@@ -1118,6 +1141,159 @@ class MetadataEnrichedQualT5(nn.Module):
 
         return F.cross_entropy(pair_logits, target_idx)
 
+    def _build_metadata_attention_mask(
+        self,
+        batch_size: int,
+        metadata_len: int,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ones(
+            (batch_size, metadata_len),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+
+    def _fusion_concat_tokens(
+        self,
+        h_text: torch.Tensor,
+        attention_mask: torch.Tensor,
+        z_meta_fused: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size = h_text.shape[0]
+
+        # Decoder attends to [z_lex ; z_emb ; z_tok ; H_text].
+        h_fused = torch.cat([z_meta_fused, h_text], dim=1)
+        meta_mask = self._build_metadata_attention_mask(
+            batch_size=batch_size,
+            metadata_len=z_meta_fused.shape[1],
+            attention_mask=attention_mask,
+        )
+        fused_attention_mask = torch.cat([meta_mask, attention_mask], dim=1)
+
+        debug = {
+            "meta_vec": z_meta_fused.mean(dim=1),
+            "metadata_tokens": z_meta_fused,
+        }
+
+        return h_fused, fused_attention_mask, debug
+
+    def _fusion_att_fusion(
+        self,
+        h_text: torch.Tensor,
+        attention_mask: torch.Tensor,
+        z_meta_fused: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size = h_text.shape[0]
+
+        # Decoder attends only to the metadata-conditioned summaries.
+        # z_meta_fused already contains: LN(Z_meta + UniAttention(Z_meta, H_text, H_text))
+        # and optionally: LN(z_meta_fused + FFN(z_meta_fused)).
+        h_fused = z_meta_fused
+        fused_attention_mask = self._build_metadata_attention_mask(
+            batch_size=batch_size,
+            metadata_len=z_meta_fused.shape[1],
+            attention_mask=attention_mask,
+        )
+
+        debug = {
+            "meta_vec": z_meta_fused.mean(dim=1),
+            "metadata_tokens": z_meta_fused,
+            "metadata_update": z_meta_fused,
+            "metadata_update_norm": z_meta_fused.norm(p=2, dim=-1).mean(dim=1),
+        }
+
+        return h_fused, fused_attention_mask, debug
+
+    def _fusion_meta_prefix(
+        self,
+        h_text: torch.Tensor,
+        attention_mask: torch.Tensor,
+        z_meta_fused: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size = h_text.shape[0]
+
+        # Decoder attends to [meta_vec ; H_text].
+        meta_vec = z_meta_fused.mean(dim=1)
+        meta_token = self.meta_prefix_ln(meta_vec).unsqueeze(1)
+
+        h_fused = torch.cat([meta_token, h_text], dim=1)
+        meta_mask = self._build_metadata_attention_mask(
+            batch_size=batch_size,
+            metadata_len=1,
+            attention_mask=attention_mask,
+        )
+        fused_attention_mask = torch.cat([meta_mask, attention_mask], dim=1)
+
+        debug = {
+            "meta_vec": meta_vec,
+            "metadata_update": meta_token,
+            "metadata_update_norm": meta_token.norm(p=2, dim=-1).squeeze(1),
+        }
+
+        return h_fused, fused_attention_mask, debug
+
+    def _fusion_pooled_concat_projection(
+        self,
+        h_text: torch.Tensor,
+        attention_mask: torch.Tensor,
+        z_meta_fused: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size, seq_len, _ = h_text.shape
+
+        # z_meta_fused: [B, 3, d]
+        meta_vec = z_meta_fused.mean(dim=1)
+
+        # meta_seq: [B, L, d]
+        meta_seq = meta_vec.unsqueeze(1).expand(-1, seq_len, -1)
+
+        # token_meta_pair: [B, L, 2d]
+        token_meta_pair = torch.cat([h_text, meta_seq], dim=-1)
+
+        # H_fused = LayerNorm(H_text + MLP([H_text ; meta_vec]))
+        metadata_update = self.pooled_concat_projection(token_meta_pair)
+        h_fused = self.pooled_concat_ln(h_text + metadata_update)
+        fused_attention_mask = attention_mask
+
+        debug = {
+            "meta_vec": meta_vec,
+            "metadata_update": metadata_update,
+            "metadata_update_norm": metadata_update.norm(p=2, dim=-1).mean(dim=1),
+        }
+
+        return h_fused, fused_attention_mask, debug
+
+    def _fusion_allmeta_token_projection(
+        self,
+        h_text: torch.Tensor,
+        attention_mask: torch.Tensor,
+        z_meta_fused: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size, seq_len, _ = h_text.shape
+
+        # Keep the three metadata groups distinct: [z_lex ; z_emb ; z_tok].
+        # z_all: [B, 3d]
+        z_all = z_meta_fused.reshape(batch_size, 3 * self.d_model)
+
+        # z_all_seq: [B, L, 3d]
+        z_all_seq = z_all.unsqueeze(1).expand(-1, seq_len, -1)
+
+        # token_meta_pair: [B, L, 4d] = [h_i ; z_lex ; z_emb ; z_tok]
+        token_meta_pair = torch.cat([h_text, z_all_seq], dim=-1)
+
+        # MLP uses GELU by design for this fusion ablation.
+        metadata_update = self.allmeta_token_projection(token_meta_pair)
+        h_fused = self.allmeta_token_projection_ln(h_text + metadata_update)
+        fused_attention_mask = attention_mask
+
+        debug = {
+            "meta_vec": z_meta_fused.mean(dim=1),
+            "z_all": z_all,
+            "metadata_update": metadata_update,
+            "metadata_update_norm": metadata_update.norm(p=2, dim=-1).mean(dim=1),
+        }
+
+        return h_fused, fused_attention_mask, debug
+
     def _apply_metadata_fusion(
         self,
         h_text: torch.Tensor,
@@ -1130,83 +1306,27 @@ class MetadataEnrichedQualT5(nn.Module):
         - fused_attention_mask
         - debug tensors
         """
-        batch_size, seq_len, _ = h_text.shape
+        fusion_dispatch = {
+            "concat_tokens": self._fusion_concat_tokens,
+            "att_fusion": self._fusion_att_fusion,
+            "pooled_concat_projection": self._fusion_pooled_concat_projection,
+            "allmeta_token_projection": self._fusion_allmeta_token_projection,
+            "meta_prefix": self._fusion_meta_prefix,
+        }
 
-        if self.metadata_fusion_mode == "concat_tokens":
-            # Decoder attends to [z_lex ; z_emb ; z_tok ; H_text].
-            h_fused = torch.cat([z_meta_fused, h_text], dim=1)
+        try:
+            fusion_fn = fusion_dispatch[self.metadata_fusion_mode]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported metadata_fusion_mode={self.metadata_fusion_mode}. "
+                f"Supported values: {sorted(self.VALID_FUSION_MODES)}"
+            ) from exc
 
-            meta_mask = torch.ones(
-                (batch_size, z_meta_fused.shape[1]),
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
-
-            fused_attention_mask = torch.cat([meta_mask, attention_mask], dim=1)
-
-            debug = {
-                "meta_vec": z_meta_fused.mean(dim=1),
-            }
-
-            return h_fused, fused_attention_mask, debug
-
-        if self.metadata_fusion_mode == "meta_prefix":
-            # Decoder attends to [meta_vec ; H_text].
-            meta_vec = z_meta_fused.mean(dim=1)
-            meta_token = self.meta_prefix_ln(meta_vec).unsqueeze(1)
-
-            h_fused = torch.cat([meta_token, h_text], dim=1)
-
-            meta_mask = torch.ones(
-                (batch_size, 1),
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
-
-            fused_attention_mask = torch.cat([meta_mask, attention_mask], dim=1)
-
-            debug = {
-                "meta_vec": meta_vec,
-                "metadata_update": meta_token,
-                "metadata_update_norm": meta_token.norm(p=2, dim=-1).squeeze(1),
-            }
-
-            return h_fused, fused_attention_mask, debug
-
-        if self.metadata_fusion_mode in {
-            "pooled_concat_projection",
-            "direct_concat_projection",
-        }:
-            # z_meta_fused: [B, 3, d]
-            meta_vec = z_meta_fused.mean(dim=1)
-
-            # meta_seq: [B, L, d]
-            meta_seq = meta_vec.unsqueeze(1).expand(-1, seq_len, -1)
-
-            # token_meta_pair: [B, L, 2d]
-            token_meta_pair = torch.cat([h_text, meta_seq], dim=-1)
-
-            # projected: [B, L, d]
-            projected = self.pooled_concat_projection(token_meta_pair)
-
-            if self.metadata_fusion_mode == "pooled_concat_projection":
-                # H_fused = LayerNorm(H_text + Linear([H_text ; meta_vec]))
-                h_fused = self.pooled_concat_ln(h_text + projected)
-            else:
-                # H_fused = LayerNorm(Linear([H_text ; meta_vec]))
-                h_fused = self.pooled_concat_ln(projected)
-
-            fused_attention_mask = attention_mask
-
-            debug = {
-                "meta_vec": meta_vec,
-                "metadata_update": projected,
-                "metadata_update_norm": projected.norm(p=2, dim=-1).mean(dim=1),
-            }
-
-            return h_fused, fused_attention_mask, debug
-
-        raise ValueError(f"Unsupported metadata_fusion_mode={self.metadata_fusion_mode}")
+        return fusion_fn(
+            h_text=h_text,
+            attention_mask=attention_mask,
+            z_meta_fused=z_meta_fused,
+        )
 
     def forward(
         self,
@@ -1348,6 +1468,8 @@ class MetadataEnrichedQualT5(nn.Module):
             "token_feature_scaler": self.token_feature_scaler.state_dict(),
             "pooled_concat_projection": self.pooled_concat_projection.state_dict(),
             "pooled_concat_ln": self.pooled_concat_ln.state_dict(),
+            "allmeta_token_projection": self.allmeta_token_projection.state_dict(),
+            "allmeta_token_projection_ln": self.allmeta_token_projection_ln.state_dict(),
         }
 
         if self.use_meta_ffn:
@@ -1402,6 +1524,12 @@ class MetadataEnrichedQualT5(nn.Module):
 
         if "pooled_concat_ln" in payload:
             self.pooled_concat_ln.load_state_dict(payload["pooled_concat_ln"])
+
+        if "allmeta_token_projection" in payload:
+            self.allmeta_token_projection.load_state_dict(payload["allmeta_token_projection"])
+
+        if "allmeta_token_projection_ln" in payload:
+            self.allmeta_token_projection_ln.load_state_dict(payload["allmeta_token_projection_ln"])
 
 
 class RunningMoments:

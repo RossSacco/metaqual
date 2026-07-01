@@ -374,17 +374,19 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=[
             "concat_tokens",
+            "att_fusion",
             "pooled_concat_projection",
-            "direct_concat_projection",
+            "allmeta_token_projection",
             "meta_prefix",
         ],
         default="pooled_concat_projection",
         help=(
             "How to fuse metadata after Uni-Attention. "
             "'concat_tokens': decoder attends to [z_lex ; z_emb ; z_tok ; H_text]. "
-            "'pooled_concat_projection': H_fused = LayerNorm(H_text + Linear([H_text ; meta_vec])). "
-            "'direct_concat_projection': H_fused = LayerNorm(Linear([H_text ; meta_vec])). "
-            "'meta_prefix': decoder attends to [meta_vec ; H_text]."
+            "'att_fusion': decoder attends only to Z_meta_fused. "
+            "'pooled_concat_projection': H_fused = LayerNorm(H_text + MLP([H_text ; mean(Z_meta_fused)])). "
+            "'allmeta_token_projection': H_fused = LayerNorm(H_text + ReLU-MLP([H_text ; z_lex ; z_emb ; z_tok])). "
+            "'meta_prefix': decoder attends to [mean(Z_meta_fused) ; H_text]."
         ),
     )
 
