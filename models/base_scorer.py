@@ -14,6 +14,14 @@ import numpy as np
 from pyterrier_quality import QualT5, Filter
 from torch.nn import functional as F
 
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+
+
+
+
+
 try:
     from metaqual.models.metadata_qualt5 import (
         LexicalMetadataStore,
@@ -406,17 +414,236 @@ class FinetunedQualT5Scorer(pt.Transformer):
 
         return res
 
+def _is_trainer_checkpoint(path: str | Path) -> bool:
+    p = Path(path)
+    return p.name.startswith("checkpoint-")
+
+
+def _metadata_asset_dir(model_path: str | Path) -> Path:
+    """
+    Directory da cui leggere metadata_qualt5_config.json, scaler e metadata_qualt5_modules.pt.
+
+    Se model_path è un checkpoint Trainer tipo checkpoint-12000,
+    questi file di solito stanno nella parent output_dir.
+    """
+    p = Path(model_path)
+
+    if _is_trainer_checkpoint(p):
+        return p.parent
+
+    return p
+
+
+def _safe_load_metadata_config(model_path: str | Path) -> Dict[str, Any]:
+    """
+    Stessa logica del diagnostic:
+    - prova a caricare metadata_qualt5_config.json da model_path
+    - se model_path è checkpoint-*, prova anche dalla parent directory
+    """
+    candidates = []
+
+    p = Path(model_path)
+    candidates.append(p)
+
+    if _is_trainer_checkpoint(p):
+        candidates.append(p.parent)
+
+    for candidate in candidates:
+        try:
+            cfg = load_metadata_qualt5_config(candidate)
+
+            if cfg:
+                print(f"[MetadataEnrichedQualT5Scorer] metadata_qualt5_config.json caricato da {candidate}")
+                print(f"[MetadataEnrichedQualT5Scorer] Metadata config: {cfg}")
+                return cfg
+
+        except Exception as exc:
+            print(
+                f"[MetadataEnrichedQualT5Scorer][WARNING] "
+                f"Impossibile caricare metadata_qualt5_config.json da {candidate}: {exc}"
+            )
+
+    print(
+        "[MetadataEnrichedQualT5Scorer][WARNING] "
+        "metadata_qualt5_config.json non trovato. Uso valori YAML/constructor."
+    )
+    return {}
+
+
+def _resolve_model_relative_path(
+    path_value: Optional[str],
+    base_dir: str | Path,
+) -> Optional[str]:
+    if path_value is None:
+        return None
+
+    p = Path(str(path_value))
+
+    if p.is_absolute():
+        return str(p)
+
+    return str(Path(base_dir) / p)
+
+
+def _checkpoint_state_dict_path(model_path: str | Path) -> Optional[Path]:
+    """
+    Se model_path punta a checkpoint-*, cerca il file dei pesi del Trainer.
+    """
+    p = Path(model_path)
+
+    if not _is_trainer_checkpoint(p):
+        return None
+
+    candidates = [
+        p / "pytorch_model.bin",
+        p / "model.safetensors",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def _load_checkpoint_state_dict(path: Path) -> Dict[str, torch.Tensor]:
+    print(f"[MetadataEnrichedQualT5Scorer] Carico state_dict checkpoint da: {path}")
+
+    if path.name.endswith(".safetensors"):
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:
+            raise ImportError(
+                "Il checkpoint è in formato safetensors, ma safetensors non è installato."
+            ) from exc
+
+        state_dict = load_file(str(path))
+    else:
+        state_dict = torch.load(path, map_location="cpu")
+
+    if isinstance(state_dict, dict):
+        for key in ["model", "state_dict", "module"]:
+            if key in state_dict and isinstance(state_dict[key], dict):
+                state_dict = state_dict[key]
+                break
+
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"Formato checkpoint non supportato: {type(state_dict)}")
+
+    cleaned = {}
+
+    for key, value in state_dict.items():
+        new_key = key
+
+        if new_key.startswith("module."):
+            new_key = new_key[len("module.") :]
+
+        cleaned[new_key] = value
+
+    return cleaned
+
+
+def _scale_metadata_features(scaler, values: np.ndarray) -> np.ndarray:
+    """
+    Stessa logica del diagnostic: usa scaler.transform se disponibile.
+    """
+    if hasattr(scaler, "transform"):
+        return scaler.transform(values).astype(np.float32)
+
+    mean = np.asarray(scaler.mean, dtype=np.float32)
+    std = np.asarray(scaler.std, dtype=np.float32)
+    std = np.where(std < 1e-6, 1.0, std)
+
+    return ((values.astype(np.float32) - mean) / std).astype(np.float32)
+
+
+def _extract_scores_from_metadata_output(
+    outputs: Any,
+    true_token_id: int,
+    false_token_id: int,
+) -> torch.Tensor:
+    """
+    Copia coerente con il diagnostic.
+    Ritorna sempre:
+        log P(true | true,false)
+    """
+    if torch.is_tensor(outputs):
+        return outputs.view(-1)
+
+    if isinstance(outputs, dict):
+        for key in [
+            "quality_score",
+            "quality_scores",
+            "scores",
+            "score",
+            "logprob_true",
+            "true_logprob",
+        ]:
+            if key in outputs and outputs[key] is not None:
+                return outputs[key].view(-1)
+
+        if "pair_logits" in outputs:
+            pair_logits = outputs["pair_logits"]
+            log_probs = torch.log_softmax(pair_logits, dim=-1)
+            return log_probs[:, 0]
+
+        if "logits_true" in outputs and "logits_false" in outputs:
+            pair_logits = torch.stack(
+                [outputs["logits_true"], outputs["logits_false"]],
+                dim=-1,
+            )
+            log_probs = torch.log_softmax(pair_logits, dim=-1)
+            return log_probs[:, 0]
+
+        if "decoder_logits" in outputs:
+            logits = outputs["decoder_logits"]
+        elif "logits" in outputs:
+            logits = outputs["logits"]
+        else:
+            raise RuntimeError(
+                f"Output dict senza chiave score/logits. Keys: {list(outputs.keys())}"
+            )
+
+    elif hasattr(outputs, "logits"):
+        logits = outputs.logits
+
+    elif isinstance(outputs, tuple) and len(outputs) > 0:
+        logits = outputs[0]
+
+    else:
+        raise RuntimeError(f"Formato output metadata model non supportato: {type(outputs)}")
+
+    if logits.ndim == 3:
+        logits = logits[:, 0, :]
+
+    if logits.ndim == 2 and logits.shape[-1] == 2:
+        log_probs = torch.log_softmax(logits, dim=-1)
+        return log_probs[:, 0]
+
+    if logits.ndim == 2 and logits.shape[-1] > max(true_token_id, false_token_id):
+        true_false_logits = torch.stack(
+            [
+                logits[:, true_token_id],
+                logits[:, false_token_id],
+            ],
+            dim=-1,
+        )
+        log_probs = torch.log_softmax(true_false_logits, dim=-1)
+        return log_probs[:, 0]
+
+    raise RuntimeError(f"Shape logits non supportata: {tuple(logits.shape)}")
+
 
 class MetadataEnrichedQualT5Scorer(pt.Transformer):
     """
-    Metadata-enriched QualT5 scorer.
+    Metadata-enriched QualT5 scorer coerente con evaluate_metadata_qualt5_diagnostic.py.
 
-    Input columns required:
+    Input richiesti:
       - docno
       - text
 
-    Output column:
-      - quality
+    Output:
+      - quality = log P(true | true,false)
     """
 
     VALID_FUSION_MODES = {
@@ -425,6 +652,12 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
         "pooled_concat_projection",
         "allmeta_token_projection",
         "meta_prefix",
+    }
+
+    VALID_DECODER_TRAINABLE_SCOPES = {
+        "cross_attention",
+        "last_n_blocks",
+        "full_decoder",
     }
 
     def __init__(
@@ -437,6 +670,8 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
         embedding_scaler_path=None,
         token_scaler_path=None,
         lexical_feature_names=None,
+        base_model_name_or_path=None,
+        text_model_path=None,
         batch_size=100,
         max_length=512,
         prompt="Document: {} Relevant:",
@@ -452,6 +687,8 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
         normalize_metadata_features=None,
         unfreeze_last_n_decoder_blocks=None,
         unfreeze_lm_head=None,
+        decoder_trainable_scope=None,
+        unfreeze_shared_embeddings=None,
         verbose=False,
     ):
         if not model_name_or_path:
@@ -473,21 +710,14 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
         self.allow_missing_metadata = bool(allow_missing_metadata)
         self.device = self._resolve_device(device)
 
-        self.model_dir = Path(self.model_name_or_path)
-        self.saved_meta_cfg = load_metadata_qualt5_config(self.model_name_or_path)
+        self.model_path = Path(self.model_name_or_path)
+        self.metadata_asset_dir = _metadata_asset_dir(self.model_path)
 
-        if self.saved_meta_cfg:
-            print(f"[MetadataEnrichedQualT5Scorer] Loaded metadata config from {self.model_name_or_path}")
-            print(f"[MetadataEnrichedQualT5Scorer] metadata_qualt5_config: {self.saved_meta_cfg}")
-        else:
-            print(
-                f"[MetadataEnrichedQualT5Scorer][WARNING] "
-                f"metadata_qualt5_config.json not found in {self.model_name_or_path}. "
-                f"Falling back to YAML/constructor values."
-            )
+        # Stessa logica del diagnostic: cerca config sia nel checkpoint sia nella parent.
+        self.saved_meta_cfg = _safe_load_metadata_config(self.model_path)
 
         # ------------------------------------------------------------
-        # Resolve lexical feature names.
+        # Feature lexical.
         # ------------------------------------------------------------
         if lexical_feature_names is None:
             lexical_feature_names = self.saved_meta_cfg.get("lexical_feature_names")
@@ -498,10 +728,7 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
         )
 
         # ------------------------------------------------------------
-        # Resolve scaler paths.
-        # Lexical scaler is applied outside the model, before passing lexical_features.
-        # Embedding/token scalers are passed to the model because x_emb and x_tok
-        # are computed online inside forward().
+        # Scaler paths.
         # ------------------------------------------------------------
         self.lexical_scaler_path = self._resolve_config_path(
             explicit_path=lexical_scaler_path or metadata_scaler_path,
@@ -542,10 +769,11 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
 
         self.scaler = MetadataFeatureScaler.load(self.lexical_scaler_path)
 
+        # Stessa sicurezza del diagnostic: l'ordine delle feature deve essere quello dello scaler.
         if list(self.lexical_store.feature_names) != list(self.scaler.feature_names):
             print(
                 "[MetadataEnrichedQualT5Scorer] Re-loading lexical metadata store "
-                "with feature names from lexical scaler."
+                "con feature_names dallo scaler."
             )
             self.lexical_store = LexicalMetadataStore.from_path(
                 self.metadata_path,
@@ -554,44 +782,47 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
 
         if list(self.lexical_store.feature_names) != list(self.scaler.feature_names):
             raise ValueError(
-                "Mismatch tra lexical_store.feature_names e lexical scaler features.\n"
+                "Mismatch tra lexical_store.feature_names e lexical scaler feature_names.\n"
                 f"store={self.lexical_store.feature_names}\n"
                 f"scaler={self.scaler.feature_names}"
             )
 
         # ------------------------------------------------------------
-        # Load tokenizer and true/false token ids.
+        # Tokenizer.
+        # Per coerenza: usa model_name_or_path se possibile.
+        # Se è un Trainer checkpoint non compatibile, usa base_model_name_or_path/text_model_path.
         # ------------------------------------------------------------
+        tokenizer_path = self._resolve_tokenizer_path(
+            base_model_name_or_path=base_model_name_or_path,
+            text_model_path=text_model_path,
+        )
+
         print(
             f"Inizializzazione MetadataEnrichedQualT5Scorer "
-            f"(model={self.model_name_or_path}, device={self.device}, "
-            f"batch_size={self.batch_size}, max_length={self.max_length})..."
+            f"(model={self.model_name_or_path}, tokenizer={tokenizer_path}, "
+            f"device={self.device}, batch_size={self.batch_size}, max_length={self.max_length})..."
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name_or_path,
+            tokenizer_path,
             use_fast=True,
         )
 
-        targets = ["true", "false"]
+        true_ids = self.tokenizer.encode("true", add_special_tokens=False)
+        false_ids = self.tokenizer.encode("false", add_special_tokens=False)
 
-        true_token_id = self.tokenizer.encode(
-            targets[0],
-            add_special_tokens=False,
-        )[0]
+        if not true_ids or not false_ids:
+            raise ValueError("Impossibile codificare i token true/false.")
 
-        false_token_id = self.tokenizer.encode(
-            targets[1],
-            add_special_tokens=False,
-        )[0]
+        self.true_token_id = int(true_ids[0])
+        self.false_token_id = int(false_ids[0])
 
-        self.true_token_id = int(true_token_id)
-        self.false_token_id = int(false_token_id)
+        print(f"[MetadataEnrichedQualT5Scorer] true token ids={true_ids}")
+        print(f"[MetadataEnrichedQualT5Scorer] false token ids={false_ids}")
 
         # ------------------------------------------------------------
-        # Resolve model hyperparameters.
-        # Important: use saved config first, because metadata_dropout changes
-        # Sequential module structure if Dropout was present during training.
+        # Config effettivo: sempre priorità al metadata_qualt5_config.json,
+        # poi fallback a YAML.
         # ------------------------------------------------------------
         scoring_mode = self.saved_meta_cfg.get(
             "scoring_mode",
@@ -608,11 +839,9 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             metadata_mlp_hidden_dim,
         )
 
-        # Backward compatibility: old checkpoints did not store this field and were trained
-        # with the previous two-layer ReLU MLP. New checkpoints should store "linear".
         metadata_projection_type = self.saved_meta_cfg.get(
             "metadata_projection_type",
-            metadata_projection_type if metadata_projection_type is not None else "mlp",
+            metadata_projection_type if metadata_projection_type is not None else "linear",
         )
 
         attention_heads = self.saved_meta_cfg.get(
@@ -645,14 +874,41 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             unfreeze_lm_head if unfreeze_lm_head is not None else True,
         )
 
+        decoder_trainable_scope = self.saved_meta_cfg.get(
+            "decoder_trainable_scope",
+            decoder_trainable_scope if decoder_trainable_scope is not None else "last_n_blocks",
+        )
+
+        unfreeze_shared_embeddings = self.saved_meta_cfg.get(
+            "unfreeze_shared_embeddings",
+            unfreeze_shared_embeddings if unfreeze_shared_embeddings is not None else False,
+        )
+
         if metadata_fusion_mode not in self.VALID_FUSION_MODES:
             raise ValueError(
                 f"metadata_fusion_mode={metadata_fusion_mode!r} non supportato. "
                 f"Valori ammessi: {sorted(self.VALID_FUSION_MODES)}"
             )
 
+        if decoder_trainable_scope not in self.VALID_DECODER_TRAINABLE_SCOPES:
+            raise ValueError(
+                f"decoder_trainable_scope={decoder_trainable_scope!r} non supportato. "
+                f"Valori ammessi: {sorted(self.VALID_DECODER_TRAINABLE_SCOPES)}"
+            )
+
+        checkpoint_state_path = _checkpoint_state_dict_path(self.model_path)
+
+        base_init_path = self._resolve_base_init_path(
+            checkpoint_state_path=checkpoint_state_path,
+            explicit_base_model_name_or_path=base_model_name_or_path,
+            explicit_text_model_path=text_model_path,
+        )
+
         print(
             "[MetadataEnrichedQualT5Scorer] Effective model config | "
+            f"base_init_path={base_init_path} | "
+            f"checkpoint_state_path={checkpoint_state_path} | "
+            f"metadata_asset_dir={self.metadata_asset_dir} | "
             f"scoring_mode={scoring_mode} | "
             f"metadata_dropout={metadata_dropout} | "
             f"metadata_mlp_hidden_dim={metadata_mlp_hidden_dim} | "
@@ -662,11 +918,13 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             f"metadata_fusion_mode={metadata_fusion_mode} | "
             f"normalize_metadata_features={normalize_metadata_features} | "
             f"unfreeze_last_n_decoder_blocks={unfreeze_last_n_decoder_blocks} | "
-            f"unfreeze_lm_head={unfreeze_lm_head}"
+            f"unfreeze_lm_head={unfreeze_lm_head} | "
+            f"decoder_trainable_scope={decoder_trainable_scope} | "
+            f"unfreeze_shared_embeddings={unfreeze_shared_embeddings}"
         )
 
         self.model = MetadataEnrichedQualT5(
-            model_name_or_path=self.model_name_or_path,
+            model_name_or_path=base_init_path,
             lexical_feature_dim=len(self.lexical_store.feature_names),
             true_token_id=self.true_token_id,
             false_token_id=self.false_token_id,
@@ -679,22 +937,46 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             normalize_metadata_features=bool(normalize_metadata_features),
             unfreeze_last_n_decoder_blocks=int(unfreeze_last_n_decoder_blocks),
             unfreeze_lm_head=bool(unfreeze_lm_head),
+            decoder_trainable_scope=str(decoder_trainable_scope),
+            unfreeze_shared_embeddings=bool(unfreeze_shared_embeddings),
             metadata_fusion_mode=str(metadata_fusion_mode),
 
-            # Lexical features are already standardized in _score_batch().
+            # Come nel diagnostic: le lexical sono scalate fuori dal modello.
             lexical_feature_scaler_path=None,
 
-            # x_emb and x_tok are computed online in model.forward(),
-            # so their scalers must be loaded inside the model.
+            # Embedding/token features vengono calcolate online nel forward.
             embedding_feature_scaler_path=self.embedding_scaler_path,
             token_feature_scaler_path=self.token_scaler_path,
         )
 
-        self.model.load_metadata_modules(self.model_name_or_path)
+        if checkpoint_state_path is not None:
+            print(
+                "[MetadataEnrichedQualT5Scorer] model_name_or_path è un Trainer checkpoint. "
+                "Carico state_dict completo."
+            )
+
+            state_dict = _load_checkpoint_state_dict(checkpoint_state_path)
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+
+            print(
+                "[MetadataEnrichedQualT5Scorer] Checkpoint caricato. "
+                f"missing_keys={len(missing)} | unexpected_keys={len(unexpected)}"
+            )
+
+            if missing:
+                print(f"[MetadataEnrichedQualT5Scorer][WARNING] Missing keys preview: {missing[:30]}")
+
+            if unexpected:
+                print(f"[MetadataEnrichedQualT5Scorer][WARNING] Unexpected keys preview: {unexpected[:30]}")
+
+        else:
+            print(f"[MetadataEnrichedQualT5Scorer] Carico moduli metadata da: {self.metadata_asset_dir}")
+            self.model.load_metadata_modules(self.metadata_asset_dir)
+
         self.model.to(self.device)
         self.model.eval()
 
-        # Final score aligned with QualT5:
+        # Coerenza finale con diagnostic:
         # quality = log P(true | true,false)
         self.model.scoring_mode = "true_logprob"
 
@@ -703,20 +985,10 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             if str(requested_device).startswith("cuda") and not torch.cuda.is_available():
                 print("[WARNING] CUDA richiesta ma non disponibile. Fallback su CPU.")
                 return torch.device("cpu")
+
             return torch.device(requested_device)
 
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    def _resolve_model_relative_path(self, path_value):
-        if path_value is None:
-            return None
-
-        p = Path(str(path_value))
-
-        if p.is_absolute():
-            return str(p)
-
-        return str(self.model_dir / p)
 
     def _resolve_config_path(
         self,
@@ -741,7 +1013,8 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             candidates.append(filename)
 
         for candidate in candidates:
-            resolved = self._resolve_model_relative_path(candidate)
+            resolved = _resolve_model_relative_path(candidate, self.metadata_asset_dir)
+
             if resolved is not None and Path(resolved).exists():
                 return resolved
 
@@ -749,42 +1022,98 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             raise FileNotFoundError(
                 f"Non riesco a trovare {label}. "
                 f"Candidati provati: {candidates}. "
-                f"Model dir: {self.model_dir}"
+                f"Metadata asset dir: {self.metadata_asset_dir}"
             )
 
         return None
 
-    def _build_prompt(self, passage_text):
+    def _resolve_tokenizer_path(
+        self,
+        *,
+        base_model_name_or_path=None,
+        text_model_path=None,
+    ) -> str:
+        candidates = [
+            self.model_path,
+            self.saved_meta_cfg.get("tokenizer_name_or_path"),
+            self.saved_meta_cfg.get("base_model_name_or_path"),
+            base_model_name_or_path,
+            text_model_path,
+        ]
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+
+            try:
+                AutoTokenizer.from_pretrained(str(candidate), use_fast=True)
+                return str(candidate)
+            except Exception:
+                continue
+
+        raise FileNotFoundError(
+            "Non riesco a caricare il tokenizer. "
+            "Aggiungi nel config YAML: base_model_name_or_path oppure text_model_path."
+        )
+
+    def _resolve_base_init_path(
+        self,
+        *,
+        checkpoint_state_path: Optional[Path],
+        explicit_base_model_name_or_path=None,
+        explicit_text_model_path=None,
+    ) -> str:
+        """
+        Stessa logica del diagnostic.
+
+        Se model_path è checkpoint-*, NON inizializzare direttamente da checkpoint-*,
+        perché può contenere chiavi del wrapper custom.
+        Inizializza da base model e poi carica lo state_dict completo.
+        """
+        if checkpoint_state_path is not None:
+            base_from_cfg = self.saved_meta_cfg.get("base_model_name_or_path")
+
+            if base_from_cfg:
+                return str(base_from_cfg)
+
+            if explicit_base_model_name_or_path:
+                return str(explicit_base_model_name_or_path)
+
+            if explicit_text_model_path:
+                return str(explicit_text_model_path)
+
+            raise ValueError(
+                "model_name_or_path punta a un Trainer checkpoint, ma non so da quale "
+                "base model inizializzare l'architettura. Aggiungi nel config YAML:\n"
+                "base_model_name_or_path: \"/home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000\""
+            )
+
+        return str(self.model_path)
+
+    def _build_prompt(self, passage_text: str) -> str:
         return self.prompt.format(passage_text)
 
     def _score_batch(self, batch_docnos, batch_texts):
         prompts = [self._build_prompt(t) for t in batch_texts]
 
-        encoded = self.tokenizer.batch_encode_plus(
+        encoded = self.tokenizer(
             prompts,
-            return_tensors="pt",
-            padding="longest",
+            padding=True,
             truncation=True,
             max_length=self.max_length,
+            return_tensors="pt",
         )
 
-        lexical_raw = self.lexical_store.lookup(
+        raw_metadata = self.lexical_store.lookup(
             batch_docnos,
             allow_missing_metadata=self.allow_missing_metadata,
         )
+        raw_metadata = np.asarray(raw_metadata, dtype=np.float32)
 
-        lexical_norm = self.scaler.transform(lexical_raw)
-
-        lexical_features = torch.tensor(
-            lexical_norm,
-            dtype=torch.float32,
-            device=self.device,
+        scaled_metadata = _scale_metadata_features(
+            self.scaler,
+            raw_metadata,
         )
-
-        encoded = {
-            key: value.to(self.device)
-            for key, value in encoded.items()
-        }
 
         batch_size = len(batch_texts)
 
@@ -800,26 +1129,26 @@ class MetadataEnrichedQualT5Scorer(pt.Transformer):
             device=self.device,
         )
 
-        use_autocast = self.device.type == "cuda"
+        batch = {
+            "input_ids": encoded["input_ids"].to(self.device),
+            "attention_mask": encoded["attention_mask"].to(self.device),
+            "lexical_features": torch.tensor(
+                scaled_metadata,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "decoder_input_ids": decoder_input_ids,
+        }
 
-        with torch.no_grad(), torch.autocast(
-            device_type=self.device.type,
-            enabled=use_autocast,
-        ):
-            outputs = self.model(
-                input_ids=encoded["input_ids"],
-                attention_mask=encoded["attention_mask"],
-                lexical_features=lexical_features,
-                decoder_input_ids=decoder_input_ids,
+        # Niente autocast: così è identico alla diagnostica.
+        with torch.no_grad():
+            outputs = self.model(**batch)
+
+            quality_scores = _extract_scores_from_metadata_output(
+                outputs,
+                true_token_id=self.true_token_id,
+                false_token_id=self.false_token_id,
             )
-
-            # Always compute final quality as log P(true | true,false).
-            pair_logits = torch.stack(
-                [outputs["logits_true"], outputs["logits_false"]],
-                dim=1,
-            )
-
-            quality_scores = F.log_softmax(pair_logits, dim=1)[:, 0]
 
         return quality_scores.detach().float().cpu().tolist()
 
@@ -895,16 +1224,19 @@ def get_scorer(nome_scorer, **kwargs):
         if lexical_feature_names is None:
             groups = kwargs.get("metadata_feature_groups", {})
             lexical_feature_names = groups.get("lexical")
-
         return MetadataEnrichedQualT5Scorer(
             model_name_or_path=kwargs.get("model_name_or_path"),
             metadata_path=kwargs.get("metadata_path"),
+
+            # Serve se model_name_or_path punta a checkpoint-* Trainer.
+            base_model_name_or_path=kwargs.get("base_model_name_or_path"),
+            text_model_path=kwargs.get("text_model_path"),
 
         # Backward-compatible lexical scaler.
             metadata_scaler_path=kwargs.get("metadata_scaler_path"),
             lexical_scaler_path=kwargs.get("lexical_scaler_path"),
 
-        # New online feature scalers.
+        # Online feature scalers.
             embedding_scaler_path=kwargs.get("embedding_scaler_path"),
             token_scaler_path=kwargs.get("token_scaler_path"),
 
@@ -925,6 +1257,10 @@ def get_scorer(nome_scorer, **kwargs):
             normalize_metadata_features=kwargs.get("normalize_metadata_features"),
             unfreeze_last_n_decoder_blocks=kwargs.get("unfreeze_last_n_decoder_blocks"),
             unfreeze_lm_head=kwargs.get("unfreeze_lm_head"),
+
+        # Questi prima mancavano: sono necessari per essere coerenti col diagnostic.
+            decoder_trainable_scope=kwargs.get("decoder_trainable_scope"),
+            unfreeze_shared_embeddings=kwargs.get("unfreeze_shared_embeddings"),
 
             verbose=kwargs.get("verbose", False),
         )
@@ -949,3 +1285,132 @@ def get_scorer(nome_scorer, **kwargs):
         
     else:
         raise ValueError(f"Scorer '{nome_scorer}' non riconosciuto.")
+
+
+
+"""
+ROOT="/home/sacco/metaqual/outputs/metadata-qualt5-att_fusion-featureaware-fullDec-lr5e5-15k"
+CKPT="$ROOT/checkpoint-12000"
+OUT="$ROOT/scorer-checkpoint-12000"
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+rsync -av "$ROOT/" "$OUT/" \
+  --exclude "checkpoint-*" \
+  --exclude "diagnostic_checkpoint_*" \
+  --exclude "model.safetensors" \
+  --exclude "pytorch_model.bin" \
+  --exclude "metadata_qualt5_modules.pt"
+
+python - "$CKPT/pytorch_model.bin" "$OUT" <<'PY'
+import sys
+import torch
+from pathlib import Path
+
+ckpt_path = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+
+sd = torch.load(ckpt_path, map_location="cpu")
+
+if isinstance(sd, dict) and "state_dict" in sd:
+    sd = sd["state_dict"]
+
+base_sd = {}
+meta_sd = {}
+
+for k, v in sd.items():
+    if k.startswith("base_model."):
+        base_sd[k[len("base_model."):]] = v
+    else:
+        meta_sd[k] = v
+
+print("Chiavi totali:", len(sd))
+print("Chiavi T5/base_model:", len(base_sd))
+print("Chiavi metadata:", len(meta_sd))
+
+torch.save(base_sd, out_dir / "pytorch_model.bin")
+torch.save(meta_sd, out_dir / "metadata_qualt5_modules.pt")
+
+print("Creato:", out_dir)
+PY
+
+"""
+
+"""
+ROOT="/home/sacco/metaqual/outputs/metadata-qualt5-att_fusion-featureaware-fullDec-lr5e5-15k"
+CKPT="$ROOT/checkpoint-12000"
+OUT="$ROOT/scorer-checkpoint-12000"
+
+python - "$CKPT/pytorch_model.bin" "$OUT" <<'PY'
+import sys
+import torch
+from pathlib import Path
+
+ckpt_path = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+
+print(f"Carico checkpoint: {ckpt_path}")
+
+sd = torch.load(ckpt_path, map_location="cpu")
+
+if isinstance(sd, dict) and "state_dict" in sd:
+    sd = sd["state_dict"]
+
+# 1. Parte T5: rimuovo prefisso base_model.
+base_sd = {}
+for k, v in sd.items():
+    if k.startswith("base_model."):
+        base_sd[k[len("base_model."):]] = v
+
+# 2. Parte metadata: creo payload annidato come vuole load_metadata_modules()
+module_prefixes = [
+    "group_encoder",
+    "uni_attention",
+    "meta_ln_1",
+    "meta_ffn",
+    "meta_ln_2",
+    "pooled_concat_projection",
+    "pooled_concat_ln",
+    "allmeta_token_projection",
+    "allmeta_token_projection_ln",
+    "meta_prefix_ln",
+    "embedding_feature_scaler",
+    "token_feature_scaler",
+]
+
+payload = {}
+
+for prefix in module_prefixes:
+    sub_sd = {}
+    prefix_dot = prefix + "."
+
+    for k, v in sd.items():
+        if k.startswith(prefix_dot):
+            sub_key = k[len(prefix_dot):]
+            sub_sd[sub_key] = v
+
+    if sub_sd:
+        payload[prefix] = sub_sd
+
+print("Chiavi totali checkpoint:", len(sd))
+print("Chiavi T5/base_model:", len(base_sd))
+print("Moduli metadata trovati:")
+for k, v in payload.items():
+    print(f"  {k}: {len(v)} chiavi")
+
+if "group_encoder" not in payload:
+    raise RuntimeError("ERRORE: group_encoder non trovato nel checkpoint.")
+
+if "uni_attention" not in payload:
+    raise RuntimeError("ERRORE: uni_attention non trovato nel checkpoint.")
+
+torch.save(base_sd, out_dir / "pytorch_model.bin")
+torch.save(payload, out_dir / "metadata_qualt5_modules.pt")
+
+print()
+print(f"Salvato T5: {out_dir / 'pytorch_model.bin'}")
+print(f"Salvato metadata modules: {out_dir / 'metadata_qualt5_modules.pt'}")
+PY
+
+"""

@@ -1028,20 +1028,20 @@ NCCL_IB_DISABLE=1 \
 nohup python -u -m metaqual.models.train_metadata_qualt5 \
   --model_name_or_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
   --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
-  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-concat-featureaware-dec1-lm-h256-lr5e5-3k \
+  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-fullDec-lr5e5-15k \
   --triples_source irds \
   --irds_dataset_id msmarco-passage/train/triples-small \
-  --max_steps 3000 \
+  --max_steps 15000 \
   --per_device_train_batch_size 8 \
   --gradient_accumulation_steps 2 \
   --learning_rate 5e-5 \
   --max_length 512 \
   --save_steps 1000 \
-  --save_total_limit 3 \
+  --save_total_limit 10 \
   --logging_steps 50 \
   --metadata_dropout 0.1 \
   --metadata_projection_type linear \
-  --metadata_fusion_mode concat_tokens \
+  --metadata_fusion_mode allmeta_token_projection \
   --metadata_normalization_mode feature_aware \
   --decoder_trainable_scope full_decoder \
   --max_scaler_examples 500000 \
@@ -1051,3 +1051,35 @@ nohup python -u -m metaqual.models.train_metadata_qualt5 \
   > metaqualt5_featureaware.log 2>&1 &
 
 '''
+
+
+"""
+CUDA_VISIBLE_DEVICES=1 \
+NCCL_P2P_DISABLE=1 \
+NCCL_IB_DISABLE=1 \
+nohup python -u -m metaqual.models.train_metadata_qualt5 \
+  --model_name_or_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
+  --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
+  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-att_fusion-featureaware-fullDec-lr5e5-15k \
+  --triples_source irds \
+  --irds_dataset_id msmarco-passage/train/triples-small \
+  --max_steps 15000 \
+  --per_device_train_batch_size 8 \
+  --gradient_accumulation_steps 2 \
+  --learning_rate 5e-5 \
+  --max_length 512 \
+  --save_steps 1000 \
+  --save_total_limit 20 \
+  --logging_steps 50 \
+  --metadata_dropout 0.1 \
+  --metadata_projection_type linear \
+  --metadata_fusion_mode allmeta_token_projection \
+  --metadata_normalization_mode feature_aware \
+  --decoder_trainable_scope full_decoder \
+  --max_scaler_examples 500000 \
+  --max_online_scaler_examples 100000 \
+  --online_scaler_batch_size 16 \
+  --bf16 \
+  --resume_from_checkpoint /home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-fullDec-lr5e5-15k/checkpoint-10000 \
+  > finetuning.log 2>&1 &
+"""

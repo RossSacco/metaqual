@@ -26,7 +26,7 @@ def checkpointed_iter(corpus_iter,dataset_name ,scorer_name, chunk_size=50000, c
     Wraps the corpus iterator. Saves progress to a text file
     and skips already processed documents on restart.
     """
-    ckpt_file = os.path.join(checkpoint_dir, f"{scorer_name}_{dataset_name}_checkpoint_MP.txt")
+    ckpt_file = os.path.join(checkpoint_dir, f"{scorer_name}_{dataset_name}_checkpoint_ALLMETAPJ.txt")
     processed_docs = 0
     
     # 1. Restore from checkpoint
@@ -73,8 +73,8 @@ def cache_gen(name_scorer, dataset_name, path_output_base="./cache", resume=True
     scorer_transformer = get_scorer(name_scorer, **kwargs)
 
     # Output folder setup
-    percorso_cache = os.path.join(path_output_base, f"{name_scorer}_{dataset_name}_MP.cache")
-    ckpt_file = os.path.join(path_output_base, f"{name_scorer}_{dataset_name}_checkpoint_MP.txt")
+    percorso_cache = os.path.join(path_output_base, f"{name_scorer}_{dataset_name}_ALLMETAPJ.cache")
+    ckpt_file = os.path.join(path_output_base, f"{name_scorer}_{dataset_name}_checkpoint_ALLMETAPJ.txt")
     
     os.makedirs(path_output_base, exist_ok=True)
 
@@ -133,4 +133,4 @@ if __name__ == "__main__":
         
         
         
-#CUDA_VISIBLE_DEVICES=0 nohup python -m metaqual.experiments.phase1_qualityscores --config metaqual/config.yaml &
+#CUDA_VISIBLE_DEVICES=0 nohup python -m metaqual.experiments.phase1_qualityscores --config metaqual/meta_config.yaml &

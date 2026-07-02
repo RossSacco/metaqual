@@ -936,7 +936,7 @@ class MetadataEnrichedQualT5(nn.Module):
         allmeta_hidden_dim = metadata_mlp_hidden_dim if metadata_mlp_hidden_dim is not None else self.d_model
         allmeta_projection_layers: list[nn.Module] = [
             nn.Linear(self.d_model * 4, allmeta_hidden_dim),
-            nn.GeLU(),
+            nn.GELU(),
         ]
 
         if metadata_dropout > 0.0:
