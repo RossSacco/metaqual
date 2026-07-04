@@ -14,6 +14,8 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, Trainer, TrainingArguments
+import shutil
+from transformers import TrainerCallback
 
 try:
     from metaqual.data.loaders.msmarco.metadata_triples_dataset import (
@@ -89,6 +91,93 @@ class MetadataQualT5Collator:
         return encoded
 
 
+class MetadataScorerCheckpointCallback(TrainerCallback):
+    """
+    A ogni save del Trainer crea una cartella parallela:
+        scorer-checkpoint-STEP/
+
+    Questa cartella è pensata per inference/upload, NON per resume training.
+    """
+
+    def __init__(
+        self,
+        *,
+        tokenizer,
+        metadata_config_template: dict,
+        lexical_scaler_path: str,
+        embedding_scaler_path: str,
+        token_scaler_path: str,
+        metadata_feature_config_path: str | None = None,
+    ):
+        self.tokenizer = tokenizer
+        self.metadata_config_template = dict(metadata_config_template)
+        self.lexical_scaler_path = lexical_scaler_path
+        self.embedding_scaler_path = embedding_scaler_path
+        self.token_scaler_path = token_scaler_path
+        self.metadata_feature_config_path = metadata_feature_config_path
+
+    def _copy_asset(self, src: str | None, dst_dir: Path) -> str | None:
+        if src is None:
+            return None
+
+        src_path = Path(src)
+
+        if not src_path.exists():
+            raise FileNotFoundError(f"Asset non trovato: {src_path}")
+
+        dst_path = dst_dir / src_path.name
+        shutil.copy2(src_path, dst_path)
+
+        return dst_path.name
+
+    def on_save(self, args, state, control, **kwargs):
+        model = kwargs.get("model")
+
+        if model is None:
+            return control
+
+        output_root = Path(args.output_dir)
+        export_dir = output_root / f"scorer-checkpoint-{state.global_step}"
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"[MetadataScorerCheckpointCallback] Salvo modello inference in: {export_dir}")
+
+        # 1. Salva la parte T5 in formato HuggingFace standard.
+        model.base_model.save_pretrained(export_dir)
+
+        # 2. Salva tokenizer.
+        self.tokenizer.save_pretrained(export_dir)
+
+        # 3. Copia scaler nella cartella esportata.
+        lexical_scaler_name = self._copy_asset(self.lexical_scaler_path, export_dir)
+        embedding_scaler_name = self._copy_asset(self.embedding_scaler_path, export_dir)
+        token_scaler_name = self._copy_asset(self.token_scaler_path, export_dir)
+
+        # 4. Prepara config con path relativi locali.
+        metadata_config = dict(self.metadata_config_template)
+
+        metadata_config["lexical_scaler_path"] = lexical_scaler_name
+        metadata_config["metadata_scaler_path"] = lexical_scaler_name
+
+        metadata_config["embedding_scaler_path"] = embedding_scaler_name
+        metadata_config["embedding_feature_scaler_path"] = embedding_scaler_name
+
+        metadata_config["token_scaler_path"] = token_scaler_name
+        metadata_config["token_feature_scaler_path"] = token_scaler_name
+
+        # 5. Salva moduli metadata + metadata_qualt5_config.json.
+        model.save_metadata_modules(export_dir, metadata_config)
+
+        # 6. Copia anche metadata_feature_config.yaml, se esiste già.
+        if self.metadata_feature_config_path is not None:
+            src = Path(self.metadata_feature_config_path)
+            if src.exists():
+                shutil.copy2(src, export_dir / src.name)
+
+        print(f"[MetadataScorerCheckpointCallback] Export completato: {export_dir}")
+
+        return control
+    
 def _setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -901,6 +990,49 @@ def main() -> None:
 
     LOGGER.info("Creo Trainer...")
     trainer_start = time.time()
+    
+    lexical_scaler_cfg_value = Path(lexical_scaler_path).name
+    embedding_scaler_cfg_value = Path(embedding_scaler_path).name
+    token_scaler_cfg_value = Path(token_scaler_path).name
+
+    metadata_config_template = {
+        "model_type": "metadata_qualt5",
+        "base_model_name_or_path": args.model_name_or_path,
+
+        "lexical_feature_names": lexical_store.feature_names,
+        "embedding_feature_names": EMBEDDING_FEATURE_NAMES,
+        "token_feature_names": TOKEN_FEATURE_NAMES,
+
+        "scoring_mode": args.scoring_mode,
+        "metadata_dropout": args.metadata_dropout,
+        "metadata_mlp_hidden_dim": args.metadata_mlp_hidden_dim,
+        "metadata_projection_type": args.metadata_projection_type,
+        "attention_heads": args.attention_heads,
+        "use_meta_ffn": not args.disable_meta_ffn,
+        "normalize_metadata_features": normalize_metadata_features,
+
+        "unfreeze_last_n_decoder_blocks": args.unfreeze_last_n_decoder_blocks,
+        "unfreeze_lm_head": not args.no_unfreeze_lm_head,
+        "decoder_trainable_scope": decoder_trainable_scope,
+        "unfreeze_full_decoder": bool(args.unfreeze_full_decoder),
+        "unfreeze_shared_embeddings": bool(args.unfreeze_shared_embeddings),
+
+        "metadata_fusion_mode": args.metadata_fusion_mode,
+        "metadata_normalization_mode": args.metadata_normalization_mode,
+
+        "lexical_feature_transforms": lexical_feature_transforms,
+        "embedding_feature_transforms": embedding_feature_transforms,
+        "token_feature_transforms": token_feature_transforms,
+
+        "lexical_scaler_path": lexical_scaler_cfg_value,
+        "metadata_scaler_path": lexical_scaler_cfg_value,
+
+        "embedding_scaler_path": embedding_scaler_cfg_value,
+        "embedding_feature_scaler_path": embedding_scaler_cfg_value,
+
+        "token_scaler_path": token_scaler_cfg_value,
+        "token_feature_scaler_path": token_scaler_cfg_value,
+    }
 
     trainer = Trainer(
         model=model,
@@ -908,6 +1040,16 @@ def main() -> None:
         train_dataset=train_dataset,
         data_collator=MetadataQualT5Collator(tokenizer),
         tokenizer=tokenizer,
+        callbacks=[
+            MetadataScorerCheckpointCallback(
+                tokenizer=tokenizer,
+                metadata_config_template=metadata_config_template,
+                lexical_scaler_path=lexical_scaler_path,
+                embedding_scaler_path=embedding_scaler_path,
+                token_scaler_path=token_scaler_path,
+                metadata_feature_config_path=str(output_dir / "metadata_feature_config.yaml"),
+            )
+        ],
     )
 
     LOGGER.info("Trainer creato in %.2f sec.", time.time() - trainer_start)
@@ -1028,27 +1170,28 @@ NCCL_IB_DISABLE=1 \
 nohup python -u -m metaqual.models.train_metadata_qualt5 \
   --model_name_or_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
   --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
-  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-fullDec-lr5e5-15k \
+  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2 \
   --triples_source irds \
   --irds_dataset_id msmarco-passage/train/triples-small \
-  --max_steps 15000 \
+  --max_steps 12000 \
   --per_device_train_batch_size 8 \
   --gradient_accumulation_steps 2 \
   --learning_rate 5e-5 \
   --max_length 512 \
   --save_steps 1000 \
-  --save_total_limit 10 \
+  --save_total_limit 12 \
   --logging_steps 50 \
   --metadata_dropout 0.1 \
   --metadata_projection_type linear \
   --metadata_fusion_mode allmeta_token_projection \
   --metadata_normalization_mode feature_aware \
+  --disable_meta_ffn \
   --decoder_trainable_scope full_decoder \
   --max_scaler_examples 500000 \
   --max_online_scaler_examples 100000 \
   --online_scaler_batch_size 16 \
   --bf16 \
-  > metaqualt5_featureaware.log 2>&1 &
+  > metadata_qualt5_3.log 2>&1 &
 
 '''
 
@@ -1060,26 +1203,27 @@ NCCL_IB_DISABLE=1 \
 nohup python -u -m metaqual.models.train_metadata_qualt5 \
   --model_name_or_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
   --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
-  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-att_fusion-featureaware-fullDec-lr5e5-15k \
+  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2 \
   --triples_source irds \
   --irds_dataset_id msmarco-passage/train/triples-small \
-  --max_steps 15000 \
+  --max_steps 12000 \
   --per_device_train_batch_size 8 \
   --gradient_accumulation_steps 2 \
   --learning_rate 5e-5 \
   --max_length 512 \
   --save_steps 1000 \
-  --save_total_limit 20 \
+  --save_total_limit 10 \
   --logging_steps 50 \
   --metadata_dropout 0.1 \
   --metadata_projection_type linear \
   --metadata_fusion_mode allmeta_token_projection \
   --metadata_normalization_mode feature_aware \
+  --disable_meta_ffn \
   --decoder_trainable_scope full_decoder \
   --max_scaler_examples 500000 \
   --max_online_scaler_examples 100000 \
   --online_scaler_batch_size 16 \
   --bf16 \
-  --resume_from_checkpoint /home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-fullDec-lr5e5-15k/checkpoint-10000 \
+  --resume_from_checkpoint /home/sacco/metaqual/outputs/metadata-qualt5-concat-featureaware-fullDec-noffnatt-lr5e5-13k/checkpoint-15000 \
   > finetuning.log 2>&1 &
 """

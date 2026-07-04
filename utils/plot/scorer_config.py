@@ -18,7 +18,7 @@ SCORERS = {
         "enabled": True,
         "group": "metadata_qualt5",
         "cache_patterns": [
-            "metadata_qualt5_{dataset_name}_CONCAT-V2-FA.cache",
+            "metadata_qualt5_{dataset_name}_CONCAT-V2-FA-ck1.cache",
         ],
         "label": "Metadata-QualT5-CONCAT-V2",
         "color": "#01FF16",

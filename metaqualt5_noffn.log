@@ -1,0 +1,2 @@
+nohup: ignoring input
+/home/sacco/metaqual/venv/bin/python: Error while finding module specification for 'metaqual.models.train_metadata_qualt5' (ModuleNotFoundError: No module named 'metaqual')

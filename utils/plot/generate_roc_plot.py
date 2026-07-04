@@ -53,7 +53,7 @@ def plot_roc(
         fpr, tpr, _ = roc_curve(labels, scores)
         roc_auc = auc(fpr, tpr)
 
-        label_text = f"{get_label(name)} ({roc_auc:.2f})"
+        label_text = f"{get_label(name)} ({roc_auc:.3f})"
 
         ax.plot(
             fpr,

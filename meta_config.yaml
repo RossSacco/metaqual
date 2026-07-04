@@ -10,16 +10,16 @@ dataset:
 experiment:
   # Nome logico dello scorer, cioè quello usato dal tuo codice in get_scorer/base_scorer.
   scorer: "metadata_qualt5"
-  index_scorer_name: "metadata_qualt5_ALLMETAPJ"
+  index_scorer_name: "metadata_qualt5_ALLMETAPJ_ck1"
   # Nome specifico dell'esperimento/cache.
   # Verrà usato per nominare la cartella degli indici.
-  scorer_output_name: "metadata_qualt5_ALLMETAPJ"
+  scorer_output_name: "metadata_qualt5_ALLMETAPJ_ck1"
 
   
   # Cache effettiva da usare.
   # Lo script cercherà:
   # /data/data-sacco/cache/metadata_qualt5_msmarco_passage_CONCAT.cache
-  cache_file: "metadata_qualt5_msmarco_passage_ALLMETAPJ.cache"
+  cache_file: "metadata_qualt5_msmarco_passage_ALLMETAPJ_ck1.cache"
 
   threshold: 0.60
   restart_cache: false
@@ -40,15 +40,15 @@ scorers:
     device: "cuda"
 
   metadata_qualt5:
-    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-fullDec-lr5e5-15k/checkpoint-12000"
+    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/scorer-checkpoint-1000"
     base_model_name_or_path: "/home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000"
     
     metadata_path: "/home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet"
 
-    lexical_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-fullDec-lr5e5-15k/lexical_metadata_scaler.pkl"
-    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-fullDec-lr5e5-15k/lexical_metadata_scaler.pkl"
-    embedding_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-fullDec-lr5e5-15k/embedding_metadata_scaler.pkl"
-    token_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-fullDec-lr5e5-15k/token_metadata_scaler.pkl"
+    lexical_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/lexical_metadata_scaler.pkl"
+    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/metadata_metadata_scaler.pkl"
+    embedding_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/embedding_metadata_scaler.pkl"
+    token_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/token_metadata_scaler.pkl"
 
     batch_size: 100
     max_length: 512
@@ -61,7 +61,7 @@ scorers:
     metadata_dropout: 0.1
     metadata_mlp_hidden_dim: 768
     attention_heads: 8
-    use_meta_ffn: true
+    use_meta_ffn: false
     normalize_metadata_features: false
     metadata_projection_type: "linear"
     metadata_normalization_mode: "feature_aware"

@@ -13,9 +13,7 @@ import torch
 from sklearn.metrics import accuracy_score, roc_auc_score
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from pathlib import Path
 import hashlib
-import pandas as pd
 
 
 def export_diagnostic_sample(
@@ -260,6 +258,49 @@ def parse_args() -> argparse.Namespace:
             "Optional maximum number of raw examples to scan after skipping. "
             "If None, scan until enough positives/negatives are collected."
         ),
+    )
+
+    parser.add_argument(
+        "--fixed_sample_path",
+        type=str,
+        default=None,
+        help=(
+            "CSV con colonne docno,text,label da usare come sample fisso. "
+            "Se fornito, non viene fatto nuovo campionamento."
+        ),
+    )
+
+    parser.add_argument(
+        "--save_sample_path",
+        type=str,
+        default=None,
+        help=(
+            "Path dove salvare il sample creato prima dello scoring. "
+            "Utile per riusarlo identico su altri checkpoint."
+        ),
+    )
+
+    parser.add_argument(
+        "--exclude_docnos_path",
+        type=str,
+        default=None,
+        help=(
+            "File .txt o .csv contenente docno da escludere dal diagnostic sample, "
+            "ad esempio docno probabilmente visti in training."
+        ),
+    )
+
+    parser.add_argument(
+        "--sample_seed",
+        type=int,
+        default=42,
+        help="Seed usato per lo shuffle finale del diagnostic sample.",
+    )
+
+    parser.add_argument(
+        "--deduplicate_docnos",
+        action="store_true",
+        help="Se attivo, evita che lo stesso docno appaia più volte nel sample diagnostic.",
     )
 
     parser.add_argument(
@@ -555,10 +596,96 @@ def load_identity_scaler(lexical_store: LexicalMetadataStore) -> MetadataFeature
     )
 
 
+def load_docno_set(path: Optional[str]) -> set[str]:
+    """
+    Carica un insieme di docno da escludere.
+
+    Supporta:
+      - .txt: un docno per riga
+      - .csv: colonna 'docno' se presente, altrimenti prima colonna
+    """
+    if path is None:
+        return set()
+
+    p = Path(path).expanduser().resolve()
+
+    if not p.exists():
+        raise FileNotFoundError(f"exclude_docnos_path non trovato: {p}")
+
+    if p.suffix.lower() == ".txt":
+        with p.open("r", encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+
+    df = pd.read_csv(p)
+
+    if df.empty:
+        return set()
+
+    if "docno" in df.columns:
+        col = "docno"
+    else:
+        col = df.columns[0]
+
+    return set(df[col].astype(str).tolist())
+
+
+def load_fixed_diagnostic_sample(
+    path: str,
+    *,
+    excluded_docnos: Optional[set[str]] = None,
+) -> pd.DataFrame:
+    """
+    Carica un diagnostic sample già salvato.
+
+    Il CSV deve contenere almeno:
+      - docno
+      - text
+      - label
+
+    Se excluded_docnos è fornito, fallisce se il fixed sample contiene docno vietati.
+    Questo è voluto: evita di valutare per sbaglio su documenti già visti in training.
+    """
+    p = Path(path).expanduser().resolve()
+
+    if not p.exists():
+        raise FileNotFoundError(f"fixed_sample_path non trovato: {p}")
+
+    df = pd.read_csv(p)
+
+    required = {"docno", "text", "label"}
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"Il sample fisso deve contenere colonne {sorted(required)}. "
+            f"Mancano: {sorted(missing)}. Colonne presenti: {list(df.columns)}"
+        )
+
+    df = df.copy()
+    df["docno"] = df["docno"].astype(str)
+    df["text"] = df["text"].astype(str)
+    df["label"] = df["label"].astype(int)
+
+    if excluded_docnos:
+        overlap = set(df["docno"]) & excluded_docnos
+        if overlap:
+            raise ValueError(
+                f"Il fixed sample contiene {len(overlap)} docno presenti "
+                f"in exclude_docnos_path. Esempi: {list(overlap)[:10]}"
+            )
+
+    LOGGER.info("Fixed diagnostic sample caricato da: %s", p)
+    LOGGER.info("Righe: %d", len(df))
+    LOGGER.info("Label distribution:\n%s", df["label"].value_counts().sort_index())
+
+    return df.reset_index(drop=True)
+
+
 def collect_balanced_examples(
     args: argparse.Namespace,
     tokenizer,
     lexical_store: LexicalMetadataStore,
+    excluded_docnos: Optional[set[str]] = None,
 ) -> pd.DataFrame:
     LOGGER.info(
         "Campiono %d positive e %d negative da %s...",
@@ -577,6 +704,18 @@ def collect_balanced_examples(
             "Limiterò la scansione a max_raw_scan=%d esempi dopo lo skip.",
             args.max_raw_scan,
         )
+
+    excluded_docnos = excluded_docnos or set()
+    seen_docnos: set[str] = set()
+
+    if excluded_docnos:
+        LOGGER.info(
+            "Escluderò %d docno dal diagnostic sample.",
+            len(excluded_docnos),
+        )
+
+    if args.deduplicate_docnos:
+        LOGGER.info("Deduplica docno attiva per il diagnostic sample.")
 
     identity_scaler = load_identity_scaler(lexical_store)
 
@@ -615,10 +754,15 @@ def collect_balanced_examples(
             LOGGER.info("Stop per max_raw_scan=%d dopo lo skip.", args.max_raw_scan)
             break
 
+        docno_str = str(docno)
+
+        if docno_str in excluded_docnos:
+            continue
+
         label_int = int(label)
 
         row = {
-            "docno": str(docno),
+            "docno": docno_str,
             "text": str(passage),
             "label": label_int,
             "text_length_chars": len(str(passage)),
@@ -626,10 +770,26 @@ def collect_balanced_examples(
             "scanned_after_skip_index": int(scanned_after_skip),
         }
 
+        accepted = False
+
         if label_int == 1 and len(positives) < args.sample_per_class:
-            positives.append(row)
+            accepted = True
         elif label_int == 0 and len(negatives) < args.sample_per_class:
+            accepted = True
+
+        if not accepted:
+            continue
+
+        if args.deduplicate_docnos and docno_str in seen_docnos:
+            continue
+
+        if label_int == 1:
+            positives.append(row)
+        else:
             negatives.append(row)
+
+        if args.deduplicate_docnos:
+            seen_docnos.add(docno_str)
 
         if scanned_after_skip % 50_000 == 0:
             LOGGER.info(
@@ -658,16 +818,17 @@ def collect_balanced_examples(
         )
 
     df = pd.DataFrame(positives + negatives)
-    df = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+    df = df.sample(frac=1.0, random_state=args.sample_seed).reset_index(drop=True)
 
     LOGGER.info("Campione finale: %d righe", len(df))
     LOGGER.info("Label distribution:\n%s", df["label"].value_counts())
 
-    LOGGER.info(
-        "Raw index range nel campione: min=%d | max=%d",
-        int(df["raw_example_index"].min()),
-        int(df["raw_example_index"].max()),
-    )
+    if "raw_example_index" in df.columns:
+        LOGGER.info(
+            "Raw index range nel campione: min=%d | max=%d",
+            int(df["raw_example_index"].min()),
+            int(df["raw_example_index"].max()),
+        )
 
     return df
 
@@ -1339,11 +1500,42 @@ def main() -> None:
     validate_scaler_features(lexical_scaler, lexical_store)
     LOGGER.info("Lexical scaler caricato e validato.")
 
-    df = collect_balanced_examples(
-        args=args,
-        tokenizer=tokenizer,
-        lexical_store=lexical_store,
-    )
+    excluded_docnos = load_docno_set(args.exclude_docnos_path)
+
+    if excluded_docnos:
+        LOGGER.info("Docno caricati da exclude_docnos_path: %d", len(excluded_docnos))
+
+    if args.fixed_sample_path is not None:
+        df = load_fixed_diagnostic_sample(
+            args.fixed_sample_path,
+            excluded_docnos=excluded_docnos,
+        )
+    else:
+        df = collect_balanced_examples(
+            args=args,
+            tokenizer=tokenizer,
+            lexical_store=lexical_store,
+            excluded_docnos=excluded_docnos,
+        )
+
+        clean_sample_path = (
+            Path(args.save_sample_path).expanduser().resolve()
+            if args.save_sample_path is not None
+            else output_dir / f"diagnostic_sample_clean_{len(df)}.csv"
+        )
+
+        export_diagnostic_sample(
+            df,
+            clean_sample_path,
+            docno_col="docno",
+            text_col="text",
+            label_col="label",
+            extra_score_cols=[
+                "raw_example_index",
+                "scanned_after_skip_index",
+                "text_length_chars",
+            ],
+        )
 
     LOGGER.info("Carico text-only model: %s", args.text_model_path)
     dtype = torch.bfloat16 if args.bf16 and device.type == "cuda" else torch.float32
@@ -1396,7 +1588,7 @@ def main() -> None:
 
     labels = df["label"].to_numpy(dtype=np.int32)
     
-    diagnostic_sample_path = output_dir / "diagnostic_sample_20000.csv"
+    diagnostic_sample_path = output_dir / "diagnostic_sample_scored.csv"
 
     export_diagnostic_sample(
         df,
@@ -1493,20 +1685,25 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
+
+
 """
+# 1) Prima crea il sample held-out fisso
 CUDA_VISIBLE_DEVICES=1 \
 NCCL_P2P_DISABLE=1 \
 NCCL_IB_DISABLE=1 \
-python -u -m metaqual.utils.diagnostic_metadata \
+python -u -m metaqual.utils.diagnostic \
   --text_model_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
   --metadata_model_path /home/sacco/metaqual/outputs/metadata-qualt5-concat-featureaware-fullDec-noffnatt-lr5e5-13k/scorer-checkpoint-18000 \
   --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
-  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-concat-featureaware-fullDec-noffnatt-lr5e5-13k/diagnostic_checkpoint_18000_examination \
+  --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-concat-featureaware-fullDec-noffnatt-lr5e5-13k/diagnostic/checkpoint-18000 \
   --triples_source irds \
   --irds_dataset_id msmarco-passage/train/triples-small \
   --sample_per_class 10000 \
-  --skip_first_raw_examples 500000 \
+  --skip_first_raw_examples 1000000 \
+  --max_raw_scan 3000000 \
+  --save_sample_path /home/sacco/metaqual/outputs/diagnostics/samples/heldout_20k_skip1M.csv \
+  --deduplicate_docnos \
   --metadata_projection_type linear \
   --metadata_fusion_mode concat_tokens \
   --decoder_trainable_scope full_decoder \
@@ -1518,58 +1715,57 @@ python -u -m metaqual.utils.diagnostic_metadata \
 """
 
 """
-REPO_ID="RossSacco/models"
-OUT="/home/sacco/metaqual/outputs/"
-BASE_TMP="/tmp/hf_upload_checkpoints"
-export HF_XET_HIGH_PERFORMANCE=1
-for CKPT in 11000 12000 13000 14000 15000
+for CKPT in 8000 9000 10000 11000 12000 
 do
-  TMP="$BASE_TMP/checkpoint-$CKPT"
-  echo "=============================="
-  echo "Preparing checkpoint-$CKPT"
-  echo "=============================="
-  rm -rf "$TMP"
-  mkdir -p "$TMP/checkpoint-$CKPT"
-  rsync -av "$OUT/checkpoint-$CKPT/" "$TMP/checkpoint-$CKPT/"
-  echo "=============================="
-  echo "Uploading checkpoint-$CKPT"
-  echo "=============================="
-  hf upload-large-folder "$REPO_ID" "$TMP" \
-    --repo-type model \
-    --num-workers 8
-  echo "Finished checkpoint-$CKPT"
+  CUDA_VISIBLE_DEVICES=1 \
+  NCCL_P2P_DISABLE=1 \
+  NCCL_IB_DISABLE=1 \
+  python -u -m metaqual.utils.diagnostic \
+    --text_model_path /home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000 \
+    --metadata_model_path /home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/scorer-checkpoint-${CKPT} \
+    --metadata_path /home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet \
+    --output_dir /home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/diagnostic/checkpoint-${CKPT} \
+    --fixed_sample_path /home/sacco/metaqual/outputs/diagnostics/samples/heldout_20k_skip1M.csv \
+    --metadata_projection_type linear \
+    --metadata_fusion_mode allmeta_token_projection  \
+    --decoder_trainable_scope full_decoder \
+    --disable_meta_ffn \
+    --batch_size 16 \
+    --max_length 512 \
+    --bf16
 done
+
+"""
+
+
+"""
+hf download RossSacco/metadata-qualt5-att_fusion-featureaware-noffnpostatt-fullDec-lr5e5-15k \
+  --repo-type model \
+  --include "scorer-checkpoint-12000/*" \
+  --local-dir /home/sacco/metaqual/outputs/metadata-qualt5-att_fusion-featureaware-noffnpostatt-fullDec-lr5e5-15k
 """
 
 """
 set -euo pipefail
-
-REPO_ID="RossSacco/models_metaqual"
+REPO_ID="RossSacco/models-metaqual"
 OUT="/home/sacco/metaqual/outputs/"
 BASE_TMP="/tmp/hf_upload_checkpoints"
 ROOT_TMP="$BASE_TMP/root_files"
-
 export HF_XET_HIGH_PERFORMANCE=1
-
 echo "=============================="
 echo "Preparing root files"
 echo "=============================="
-
 rm -rf "$ROOT_TMP"
 mkdir -p "$ROOT_TMP"
-
 rsync -av "$OUT/" "$ROOT_TMP/" \
   --exclude "runs/" \
   --exclude "__pycache__/" \
   --exclude "*.log"
-
 echo "=============================="
 echo "Uploading root files"
 echo "=============================="
-
 hf upload-large-folder "$REPO_ID" "$ROOT_TMP" \
   --repo-type model \
   --num-workers 8
-
-echo "Finished root files upload"
+echo "Finished root files upload."
 """

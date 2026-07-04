@@ -1,9 +1,14 @@
 import os
 import argparse
 import pickle
+import time
 
 import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 from sklearn.metrics import roc_curve, auc
 
 from metaqual.utils.plot.scorer_config import (
@@ -17,11 +22,6 @@ from metaqual.utils.plot.scorer_config import (
 
 
 def interpolate_tpr(fpr, tpr, grid):
-    """
-    Interpola la TPR su una griglia comune di FPR.
-    Gestisce FPR duplicati prendendo la TPR massima per ogni FPR.
-    """
-
     fpr = np.asarray(fpr)
     tpr = np.asarray(tpr)
 
@@ -29,14 +29,10 @@ def interpolate_tpr(fpr, tpr, grid):
     fpr = fpr[order]
     tpr = tpr[order]
 
-    unique_fpr = np.unique(fpr)
+    unique_fpr, idx = np.unique(fpr, return_index=True)
+    last_idx = np.r_[idx[1:] - 1, len(fpr) - 1]
 
-    unique_tpr = np.array([
-        tpr[fpr == value].max()
-        for value in unique_fpr
-    ])
-
-    return np.interp(grid, unique_fpr, unique_tpr)
+    return np.interp(grid, unique_fpr, tpr[last_idx])
 
 
 def plot_delta_tpr(
@@ -46,10 +42,20 @@ def plot_delta_tpr(
     fpr_min=0.80,
     fpr_max=1.00,
 ):
+    import time
+
+    print(f"[DEBUG] Carico pickle da: {input_file}", flush=True)
+    t0 = time.time()
+
     with open(input_file, "rb") as f:
         data = pickle.load(f)
 
-    labels = data["labels"]
+    print(f"[DEBUG] Pickle caricato in {time.time() - t0:.2f} sec", flush=True)
+    print(f"[DEBUG] Chiavi pickle: {data.keys()}", flush=True)
+    print(f"[DEBUG] Scorers nel pickle: {list(data['scorers'].keys())}", flush=True)
+
+    labels = np.asarray(data["labels"])
+    print(f"[DEBUG] Labels shape: {labels.shape}, dtype={labels.dtype}", flush=True)
 
     if base_model not in data["scorers"]:
         raise ValueError(f"Base model non trovato nel pickle: {base_model}")
@@ -62,25 +68,50 @@ def plot_delta_tpr(
         if name != base_model
     ]
 
-    print("Base model:")
-    print(f"- {base_model}")
+    print("Base model:", flush=True)
+    print(f"- {base_model}", flush=True)
 
-    print("\nScorers abilitati nel config:")
+    print("\nScorers abilitati nel config:", flush=True)
     for scorer in enabled_scorers:
-        print(f"- {scorer}")
+        print(f"- {scorer}", flush=True)
 
-    print("\nModelli da confrontare:")
+    print("\nModelli da confrontare:", flush=True)
     for scorer in compare_models:
-        print(f"- {scorer}")
+        print(f"- {scorer}", flush=True)
+
+    print("[DEBUG] Preparo scores baseline...", flush=True)
+    t0 = time.time()
 
     base_raw_scores = data["scorers"][base_model]
     base_scores = prepare_scores_for_roc(base_model, base_raw_scores)
+    base_scores = np.asarray(base_scores, dtype=np.float64)
+
+    print(
+        f"[DEBUG] Baseline scores pronti in {time.time() - t0:.2f} sec | "
+        f"shape={base_scores.shape}, dtype={base_scores.dtype}",
+        flush=True,
+    )
+
+    print("[DEBUG] Calcolo ROC baseline...", flush=True)
+    t0 = time.time()
 
     base_fpr, base_tpr, _ = roc_curve(labels, base_scores)
     base_auc = auc(base_fpr, base_tpr)
 
+    print(
+        f"[DEBUG] ROC baseline calcolata in {time.time() - t0:.2f} sec | "
+        f"AUC={base_auc:.6f}",
+        flush=True,
+    )
+
     fpr_grid = np.linspace(fpr_min, fpr_max, 1000)
+
+    print("[DEBUG] Interpolo baseline...", flush=True)
+    t0 = time.time()
+
     base_tpr_interp = interpolate_tpr(base_fpr, base_tpr, fpr_grid)
+
+    print(f"[DEBUG] Baseline interpolata in {time.time() - t0:.2f} sec", flush=True)
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
@@ -89,17 +120,41 @@ def plot_delta_tpr(
 
     for name in compare_models:
         if name not in data["scorers"]:
-            print(f"[WARNING] Scorer enabled=True ma non trovato nel pickle: {name}")
+            print(f"[WARNING] Scorer enabled=True ma non trovato nel pickle: {name}", flush=True)
             continue
+
+        print(f"[DEBUG] Preparo scores per {name}...", flush=True)
+        t0 = time.time()
 
         raw_scores = data["scorers"][name]
         scores = prepare_scores_for_roc(name, raw_scores)
+        scores = np.asarray(scores, dtype=np.float64)
+
+        print(
+            f"[DEBUG] Scores {name} pronti in {time.time() - t0:.2f} sec | "
+            f"shape={scores.shape}, dtype={scores.dtype}",
+            flush=True,
+        )
+
+        print(f"[DEBUG] Calcolo ROC per {name}...", flush=True)
+        t0 = time.time()
 
         fpr, tpr, _ = roc_curve(labels, scores)
         roc_auc = auc(fpr, tpr)
 
+        print(
+            f"[DEBUG] ROC {name} calcolata in {time.time() - t0:.2f} sec | "
+            f"AUC={roc_auc:.6f}",
+            flush=True,
+        )
+
+        print(f"[DEBUG] Interpolo {name}...", flush=True)
+        t0 = time.time()
+
         tpr_interp = interpolate_tpr(fpr, tpr, fpr_grid)
         delta_tpr = tpr_interp - base_tpr_interp
+
+        print(f"[DEBUG] Interpolazione {name} completata in {time.time() - t0:.2f} sec", flush=True)
 
         all_deltas.append(delta_tpr)
 
@@ -153,11 +208,26 @@ def plot_delta_tpr(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight")
+    print("[DEBUG] Salvo PNG...", flush=True)
+    t0 = time.time()
 
-    print(f"\nGrafico salvato in: {output_path}")
-    print(f"Grafico salvato in: {output_path.replace('.png', '.pdf')}")
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+
+    print(f"[DEBUG] PNG salvato in {time.time() - t0:.2f} sec: {output_path}", flush=True)
+
+    pdf_path = output_path.replace(".png", ".pdf")
+
+    print("[DEBUG] Salvo PDF...", flush=True)
+    t0 = time.time()
+
+    plt.savefig(pdf_path, bbox_inches="tight")
+
+    print(f"[DEBUG] PDF salvato in {time.time() - t0:.2f} sec: {pdf_path}", flush=True)
+
+    plt.close(fig)
+
+    print(f"\nGrafico salvato in: {output_path}", flush=True)
+    print(f"Grafico salvato in: {pdf_path}", flush=True)
 
 
 def main():
