@@ -9,7 +9,7 @@ from matplotlib.lines import Line2D
 
 
 BASE1 = "results2"
-RES = "metaqual/utils/statistical/results_sts3"
+RES = "metaqual/utils/statistical/results_sts4"
 
 # Se vuoi plottare sempre RR@10, lascia True.
 # Se invece vuoi mantenere la logica:
@@ -104,14 +104,17 @@ def fix_legacy_metadata_names(df):
         df["qrels_variant"] = None
 
     known_variants = [
-        "pooledconcat",
-        "pooled_concat",
-        "concat",
-        "mp",
-        "POOLEDCONCAT",
-        "POOLED_CONCAT",
-        "CONCAT",
-        "MP",
+        #"pooledconcat",
+        #"pooled_concat",
+        #"concat",
+        #"mp",
+        #"POOLEDCONCAT",
+        #"POOLED_CONCAT",
+        #"CONCAT",
+        #"MP",
+        "CONCAT-V2-FA-ck1",
+        "ATTFUS-ck5",
+        "ALLMETAPJ-ck1",
     ]
 
     for idx, row in df.iterrows():

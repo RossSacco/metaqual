@@ -872,3 +872,4 @@ if __name__ == "__main__":
     main()
     
     
+#CUDA_VISIBLE_DEVICES=0 nohup python -m metaqual.experiments.phase1_baselinePrunedOnly --config metaqual/meta_config.yaml > scoring2.log 2>&1 &

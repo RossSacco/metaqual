@@ -8,8 +8,19 @@ dataset:
     - "test-2020"
 
 experiment:
+  # Nome logico dello scorer, cioè quello usato dal tuo codice in get_scorer/base_scorer.
   scorer: "metadata_qualt5"
-  index_scorer_name: "metadata_qualt5_MP"
+  index_scorer_name: "metadata_qualt5_ALLMETAPJ_ck1"
+  # Nome specifico dell'esperimento/cache.
+  # Verrà usato per nominare la cartella degli indici.
+  scorer_output_name: "metadata_qualt5_ALLMETAPJ_ck1"
+
+  
+  # Cache effettiva da usare.
+  # Lo script cercherà:
+  # /data/data-sacco/cache/metadata_qualt5_msmarco_passage_CONCAT.cache
+  cache_file: "metadata_qualt5_msmarco_passage_ALLMETAPJ_ck1.cache"
+
   threshold: 0.60
   restart_cache: false
   retriever: "all"
@@ -29,16 +40,15 @@ scorers:
     device: "cuda"
 
   metadata_qualt5:
-    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP"
+    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/scorer-checkpoint-1000"
+    base_model_name_or_path: "/home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000"
+    
     metadata_path: "/home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet"
-
-    # Scaler lessicale. Puoi lasciare anche metadata_scaler_path per compatibilità.
-    lexical_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP/lexical_metadata_scaler.pkl"
-    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP/lexical_metadata_scaler.pkl"
-
-    # Scaler delle feature online x_emb e x_tok.
-    embedding_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP/embedding_metadata_scaler.pkl"
-    token_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-metaprefix-dec2-nolm-h256-lr1e5-5k-cacheMP/token_metadata_scaler.pkl"
+  
+    lexical_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/lexical_metadata_scaler.pkl"
+    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/metadata_metadata_scaler.pkl"
+    embedding_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/embedding_metadata_scaler.pkl"
+    token_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/token_metadata_scaler.pkl"
     batch_size: 100
     max_length: 512
     device: "cuda"
@@ -46,15 +56,18 @@ scorers:
     scoring_mode: "true_logprob"
     allow_missing_metadata: false
 
-    # Deve combaciare con la run.
-    metadata_fusion_mode: "concat_tokens"
+    metadata_fusion_mode: "allmeta_token_projection"
     metadata_dropout: 0.1
-    metadata_mlp_hidden_dim: 256
+    metadata_mlp_hidden_dim: 768
     attention_heads: 8
-    use_meta_ffn: true
+    use_meta_ffn: false
     normalize_metadata_features: false
-    unfreeze_last_n_decoder_blocks: 1
+    metadata_projection_type: "linear"
+    metadata_normalization_mode: "feature_aware"
+    decoder_trainable_scope: "full_decoder"
     unfreeze_lm_head: true
+    unfreeze_shared_embeddings: false
+
 
     metadata_feature_groups:
       lexical:

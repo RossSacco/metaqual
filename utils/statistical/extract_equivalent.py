@@ -2,7 +2,7 @@ import os
 import pandas as pd
 
 
-BASE_DIR = "metaqual/utils/statistical/results_sts3"
+BASE_DIR = "metaqual/utils/statistical/results_sts4"
 
 INPUT_CSV = os.path.join(
     BASE_DIR,

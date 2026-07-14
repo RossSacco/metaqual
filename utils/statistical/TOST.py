@@ -9,7 +9,7 @@ from statsmodels.stats.weightstats import ttost_paired
 
 
 INPUT_DIR = "results2"
-BASE_DIR = "metaqual/utils/statistical/results_sts3"
+BASE_DIR = "metaqual/utils/statistical/results_sts4"
 
 ALPHA = 0.05
 REL_LOWER_BOUND = 0.05

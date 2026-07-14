@@ -158,7 +158,7 @@ def plot_delta_tpr(
 
         all_deltas.append(delta_tpr)
 
-        label_text = f"{get_label(name)} ({roc_auc:.2f})"
+        label_text = f"{get_label(name)} ({roc_auc:.3f})"
 
         ax.plot(
             fpr_grid,

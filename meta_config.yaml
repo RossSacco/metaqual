@@ -44,12 +44,11 @@ scorers:
     base_model_name_or_path: "/home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000"
     
     metadata_path: "/home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet"
-
+  
     lexical_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/lexical_metadata_scaler.pkl"
     metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/metadata_metadata_scaler.pkl"
     embedding_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/embedding_metadata_scaler.pkl"
     token_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/token_metadata_scaler.pkl"
-
     batch_size: 100
     max_length: 512
     device: "cuda"
