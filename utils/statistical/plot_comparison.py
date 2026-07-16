@@ -5,6 +5,8 @@ import re
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
@@ -19,7 +21,7 @@ from metaqual.utils.plot.scorer_config import (
 
 
 BASE1 = "results2"
-RES = "metaqual/utils/statistical/results_sts4"
+RES = "metaqual/utils/statistical/results_stsRR"
 
 # Se vuoi plottare sempre RR@10, lascia True.
 # Se invece vuoi mantenere la logica:
@@ -29,18 +31,25 @@ RES = "metaqual/utils/statistical/results_sts4"
 FORCE_RR10 = False
 
 
-LEGACY_VARIANTS = {
-    "CONCAT-V2-FA-ck1": "metadata_qualt5_concat_v2",
-    "CONCAT-V2-FA_ck1": "metadata_qualt5_concat_v2",
-    "ATTFUS-ck5": "metadata_qualt5_attfus",
-    "ATTFUS_ck5": "metadata_qualt5_attfus",
-    "ALLMETAPJ-ck1": "metadata_qualt5_allmetapj",
-    "ALLMETAPJ_ck1": "metadata_qualt5_allmetapj",
-    "MP": "metadata_qualt5_mp",
-    "CONCAT": "metadata_qualt5_concat_v1",
-    "POOLEDCONCAT": "metadata_qualt5_pooled",
-    "POOLED_CONCAT": "metadata_qualt5_pooled",
-}
+BASELINE_SCORER = "finetuned_qualt5"
+BASELINE_LABEL = "QualT5-Finetuned"
+
+# Nome esatto dello scorer ricavato dai file:
+#   results2/compare_all_finetuned_qualt5_<qrels>_<threshold>.csv
+
+def normalize_scorer_token(value):
+    """Normalizza un nome scorer senza cambiarne il significato."""
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+
+
+def resolve_compare_scorer(raw_scorer):
+    """
+    Riconosce esplicitamente la baseline dal nome esatto del file.
+    Non converte `qualt5` o altri alias in `finetuned_qualt5`.
+    """
+    if normalize_scorer_token(raw_scorer) == BASELINE_SCORER:
+        return BASELINE_SCORER
+    return resolve_scorer_name(raw_scorer)
 
 
 def parse_args():
@@ -93,7 +102,7 @@ def parse_args():
         type=str,
         default=RES,
         help=(
-            f"Directory con TOST e, se --plot-dir non è specificato, anche output grafici. "
+            f"Directory di supporto e, se --plot-dir non è specificato, anche output grafici. "
             f"Default: {RES}"
         ),
     )
@@ -118,14 +127,16 @@ def parse_args():
         "--safe-retained",
         type=float,
         default=0.99,
-        help="Soglia retained effectiveness per maximum safe pruning. Default: 0.99",
+        help=("Soglia minima di efficacia mantenuta rispetto a "
+              "QualT5-Finetuned allo stesso livello di pruning. Default: 0.99"),
     )
 
     parser.add_argument(
         "--safe-delta",
         type=float,
         default=None,
-        help="Alternativa a --safe-retained: soglia delta metrica, es. -0.005.",
+        help=("Alternativa a --safe-retained: soglia minima del delta rispetto a "
+              "QualT5-Finetuned, es. -0.005."),
     )
 
     return parser.parse_args()
@@ -175,49 +186,6 @@ def parse_compare_filename(path):
     return scorer_name, qrels_variant, threshold
 
 
-def fix_legacy_metadata_names(df):
-    """
-    Retrocompatibilità per vecchi CSV TOST.
-
-    Caso legacy:
-        scorer = metadata_qualt5
-        qrels_variant = ATTFUS-ck5_test-2019_test-2020
-
-    Diventa:
-        scorer = metadata_qualt5_attfus
-        qrels_variant = test-2019_test-2020
-    """
-    if df.empty:
-        return df
-
-    df = df.copy()
-
-    if "qrels_variant" not in df.columns:
-        df["qrels_variant"] = None
-
-    for idx, row in df.iterrows():
-        scorer = str(row.get("scorer", ""))
-        qrels_variant = row.get("qrels_variant", None)
-
-        if scorer != "metadata_qualt5":
-            continue
-
-        if pd.isna(qrels_variant):
-            continue
-
-        qrels_str = str(qrels_variant)
-
-        for variant, canonical_scorer in LEGACY_VARIANTS.items():
-            prefix = variant + "_"
-
-            if qrels_str.startswith(prefix):
-                df.at[idx, "scorer"] = canonical_scorer
-                df.at[idx, "qrels_variant"] = qrels_str[len(prefix):]
-                break
-
-    return df
-
-
 def load_performance_dataframe(summary_files, active_scorers):
     rows = []
 
@@ -230,7 +198,7 @@ def load_performance_dataframe(summary_files, active_scorers):
             print(f"[WARNING] Nome file non compatibile, salto: {name}")
             continue
 
-        scorer = resolve_scorer_name(raw_scorer)
+        scorer = resolve_compare_scorer(raw_scorer)
 
         if scorer is None:
             print(f"[WARNING] Scorer non presente nel config, salto: {raw_scorer} | file={name}")
@@ -268,47 +236,8 @@ def load_performance_dataframe(summary_files, active_scorers):
     return pd.DataFrame(rows)
 
 
-def load_tost_dataframe(tost_path, active_scorers):
-    if not os.path.exists(tost_path):
-        raise FileNotFoundError(
-            f"File TOST non trovato: {tost_path}\n"
-            "Esegui prima lo script TOST aggiornato."
-        )
-
-    tost_df = pd.read_csv(tost_path)
-    tost_df = fix_legacy_metadata_names(tost_df)
-
-    tost_df["scorer"] = tost_df["scorer"].apply(resolve_scorer_name)
-    tost_df = tost_df[tost_df["scorer"].notna()].copy()
-
-    tost_keep = tost_df.rename(
-        columns={"passes_pruning_tost_p_lt_0.05": "equivalent"}
-    ).copy()
-
-    required_tost_cols = [
-        "scorer",
-        "qrels_variant",
-        "threshold",
-        "pipeline",
-        "metric",
-        "mean_full",
-        "equivalent",
-    ]
-
-    missing_cols = [c for c in required_tost_cols if c not in tost_keep.columns]
-    if missing_cols:
-        raise ValueError(
-            f"Nel file TOST mancano queste colonne: {missing_cols}\n"
-            "Rigenera il file TOST con lo script aggiornato."
-        )
-
-    tost_keep = tost_keep[required_tost_cols].copy()
-    tost_keep = tost_keep[tost_keep["scorer"].isin(active_scorers)].copy()
-
-    return tost_keep
-
-
-def make_long_plot_dataframe(perf_df, tost_keep):
+def make_long_plot_dataframe(perf_df):
+    """Converte i risultati in formato long, senza usare riferimenti al modello non potato."""
     long_rows = []
 
     for _, r in perf_df.iterrows():
@@ -325,18 +254,11 @@ def make_long_plot_dataframe(perf_df, tost_keep):
 
     plot_df = pd.DataFrame(long_rows)
 
+    if plot_df.empty:
+        return plot_df
+
     # Retrocompatibilità per vecchie run senza qrels_variant nel nome.
     plot_df["qrels_variant"] = plot_df["qrels_variant"].fillna("dev.small")
-    tost_keep["qrels_variant"] = tost_keep["qrels_variant"].fillna("dev.small")
-
-    plot_df = plot_df.merge(
-        tost_keep,
-        on=["scorer", "qrels_variant", "threshold", "pipeline", "metric"],
-        how="left",
-    )
-
-    plot_df["equivalent"] = plot_df["equivalent"].fillna(False)
-
     return plot_df
 
 
@@ -353,6 +275,13 @@ def choose_metric(qrels_val, force_rr10=False):
 
 
 def plot_all(plot_df, scorer_order, scorer_labels, scorer_styles, plot_dir, force_rr10=False):
+    """
+    Disegna le curve potate dei modelli selezionati.
+
+    QualT5-Finetuned è mostrato come curva di baseline. Non viene aggiunto alcun
+    punto artificiale al pruning 0% e non viene tracciata alcuna linea del modello
+    non potato.
+    """
     pipelines = ["BM25", "SPLADE", "TAS-B"]
 
     for qrels_val in sorted(plot_df["qrels_variant"].dropna().unique()):
@@ -380,29 +309,6 @@ def plot_all(plot_df, scorer_order, scorer_labels, scorer_styles, plot_dir, forc
 
             plt.figure(figsize=(9.6, 5.8))
             ax = plt.gca()
-
-            first_nonempty = None
-
-            for scorer in scorer_order:
-                s = sub[sub["scorer"] == scorer].sort_values("pruning_percent")
-
-                if not s.empty and "mean_full" in s.columns and pd.notna(s["mean_full"].iloc[0]):
-                    first_nonempty = s
-                    break
-
-            if first_nonempty is not None:
-                full_val = float(first_nonempty["mean_full"].iloc[0])
-                x_max = max([0.0] + sub["pruning_percent"].dropna().tolist())
-
-                full_line, = ax.plot(
-                    [0.0, x_max],
-                    [full_val, full_val],
-                    color="black",
-                    linestyle="--",
-                    linewidth=1.4,
-                )
-                full_line.set_dashes((6, 3))
-
             present_scorers = []
 
             for scorer in scorer_order:
@@ -412,22 +318,11 @@ def plot_all(plot_df, scorer_order, scorer_labels, scorer_styles, plot_dir, forc
                     continue
 
                 present_scorers.append(scorer)
-
-                if "mean_full" in s.columns and pd.notna(s["mean_full"].iloc[0]):
-                    full_val = float(s["mean_full"].iloc[0])
-                elif first_nonempty is not None:
-                    full_val = float(first_nonempty["mean_full"].iloc[0])
-                else:
-                    full_val = float(s["value"].max())
-
-                x_vals = [0.0] + s["pruning_percent"].tolist()
-                y_vals = [full_val] + s["value"].tolist()
-
                 style = scorer_styles[scorer]
 
                 line, = ax.plot(
-                    x_vals,
-                    y_vals,
+                    s["pruning_percent"],
+                    s["value"],
                     color=style["color"],
                     linestyle=style["linestyle"],
                     linewidth=2.0,
@@ -438,25 +333,14 @@ def plot_all(plot_df, scorer_order, scorer_labels, scorer_styles, plot_dir, forc
                 if style.get("dashes") is not None:
                     line.set_dashes(style["dashes"])
 
-                eq = s[s["equivalent"] == True]
-
-                if not eq.empty:
-                    ax.scatter(
-                        eq["pruning_percent"],
-                        eq["value"],
-                        s=180,
-                        facecolors=style["color"],
-                        alpha=0.5,
-                        edgecolors=style["color"],
-                        linewidths=1.5,
-                        zorder=5,
-                    )
-
             ax.set_xlabel("Pruning percentage")
             ax.set_ylabel(metric_to_plot)
-            ax.set_title(f"{pipeline} – {metric_to_plot} ({qrels_val})")
+            ax.set_title(
+                f"{pipeline} – {metric_to_plot} ({qrels_val})\n"
+                f"Baseline: {BASELINE_LABEL}"
+            )
 
-            xticks = [0.0] + sorted(sub["pruning_percent"].dropna().unique().tolist())
+            xticks = sorted(sub["pruning_percent"].dropna().unique().tolist())
             ax.set_xticks(xticks)
             ax.set_xticklabels([
                 f"{int(x)}%" if x == int(x) else f"{x:g}%"
@@ -464,21 +348,11 @@ def plot_all(plot_df, scorer_order, scorer_labels, scorer_styles, plot_dir, forc
             ])
 
             legend_handles = []
-
-            h_full = Line2D(
-                [0],
-                [0],
-                color="black",
-                linewidth=1.8,
-                linestyle="--",
-                marker=None,
-                label="Full",
-            )
-            h_full.set_dashes((6, 3))
-            legend_handles.append(h_full)
-
             for scorer in present_scorers:
                 style = scorer_styles[scorer]
+                label = scorer_labels[scorer]
+                if scorer == BASELINE_SCORER:
+                    label = f"{label} (baseline)"
 
                 h = Line2D(
                     [0],
@@ -488,25 +362,13 @@ def plot_all(plot_df, scorer_order, scorer_labels, scorer_styles, plot_dir, forc
                     linestyle=style["linestyle"],
                     marker=style.get("marker", "o"),
                     markersize=5,
-                    label=scorer_labels[scorer],
+                    label=label,
                 )
 
                 if style.get("dashes") is not None:
                     h.set_dashes(style["dashes"])
 
                 legend_handles.append(h)
-
-            h_equiv = Line2D(
-                [0],
-                [0],
-                color="gray",
-                marker="o",
-                linestyle="None",
-                markersize=12,
-                alpha=0.5,
-                label="TOST equivalent",
-            )
-            legend_handles.append(h_equiv)
 
             ax.legend(
                 handles=legend_handles,
@@ -536,17 +398,18 @@ def plot_all(plot_df, scorer_order, scorer_labels, scorer_styles, plot_dir, forc
 
 def make_selected_metric_df(plot_df, force_rr10=False):
     """
-    Usa lo stesso plot_df creato dallo script.
+    Seleziona la metrica da visualizzare e associa a ogni risultato il valore
+    prodotto da QualT5-Finetuned nella stessa identica configurazione:
 
-    Output:
-        una riga per scorer/pipeline/qrels/pruning solo per la metrica scelta:
-        - dev.small -> RR@10
-        - test-* -> nDCG@10
-        - oppure RR@10 se force_rr10=True
+      - stesso qrels_variant;
+      - stessa retrieval pipeline;
+      - stessa metrica;
+      - stesso threshold/livello di pruning.
 
     Aggiunge:
-        delta_value = value - mean_full
-        retained = value / mean_full
+        baseline_value = valore di QualT5-Finetuned
+        delta_value    = value - baseline_value
+        retained       = value / baseline_value
     """
     parts = []
 
@@ -568,15 +431,64 @@ def make_selected_metric_df(plot_df, force_rr10=False):
         raise ValueError("Nessun dato disponibile per le metriche selezionate.")
 
     df = pd.concat(parts, ignore_index=True)
-
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df["mean_full"] = pd.to_numeric(df["mean_full"], errors="coerce")
+    df["threshold"] = pd.to_numeric(df["threshold"], errors="coerce")
     df["pruning_percent"] = pd.to_numeric(df["pruning_percent"], errors="coerce")
 
-    df = df.dropna(subset=["value", "mean_full", "pruning_percent"]).copy()
+    # Una chiave arrotondata evita mancate corrispondenze dovute alla
+    # rappresentazione floating point di soglie come 0.3 o 0.6.
+    df["pruning_key"] = df["pruning_percent"].round(8)
 
-    df["delta_value"] = df["value"] - df["mean_full"]
-    df["retained"] = df["value"] / df["mean_full"]
+    baseline_keys = [
+        "qrels_variant",
+        "pipeline",
+        "metric",
+        "pruning_key",
+    ]
+
+    baseline_df = (
+        df[df["scorer"] == BASELINE_SCORER]
+        .groupby(baseline_keys, as_index=False)["value"]
+        .mean()
+        .rename(columns={"value": "baseline_value"})
+    )
+
+    if baseline_df.empty:
+        raise ValueError(
+            f"Non sono stati trovati risultati per la baseline {BASELINE_LABEL} "
+            f"({BASELINE_SCORER}). Controlla che esistano i file "
+            "compare_all_finetuned_qualt5_*.csv."
+        )
+
+    df = df.merge(baseline_df, on=baseline_keys, how="left")
+
+    missing = df["baseline_value"].isna()
+    if missing.any():
+        missing_cfg = (
+            df.loc[missing, ["qrels_variant", "pipeline", "metric", "threshold"]]
+            .drop_duplicates()
+            .sort_values(["qrels_variant", "pipeline", "metric", "threshold"])
+        )
+        print(
+            "[WARNING] Mancano risultati QualT5-Finetuned per alcune configurazioni; "
+            "queste righe non saranno usate nei confronti relativi:"
+        )
+        print(missing_cfg.to_string(index=False))
+
+    df = df.dropna(
+        subset=["value", "baseline_value", "pruning_percent"]
+    ).copy()
+
+    df["baseline_scorer"] = BASELINE_SCORER
+    df["baseline_label"] = BASELINE_LABEL
+    df["delta_value"] = df["value"] - df["baseline_value"]
+
+    nonzero_baseline = ~np.isclose(df["baseline_value"], 0.0)
+    df["retained"] = np.where(
+        nonzero_baseline,
+        df["value"] / df["baseline_value"],
+        np.nan,
+    )
 
     return df
 
@@ -617,7 +529,7 @@ def plot_extra_line(
                 color="black",
                 linestyle="--",
                 linewidth=1.5,
-                label="Full baseline",
+                label=f"{BASELINE_LABEL} reference",
             )
 
             for scorer in scorer_order:
@@ -626,26 +538,20 @@ def plot_extra_line(
                 if s.empty:
                     continue
 
-                x_vals = [0.0] + s["pruning_percent"].tolist()
-
-                if y_col == "delta_value":
-                    y_vals = [0.0] + s[y_col].tolist()
-                elif y_col == "retained":
-                    y_vals = [1.0] + s[y_col].tolist()
-                else:
-                    y_vals = [float(s["mean_full"].iloc[0])] + s[y_col].tolist()
-
                 style = scorer_styles[scorer]
+                label = scorer_labels[scorer]
+                if scorer == BASELINE_SCORER:
+                    label = f"{label} (baseline)"
 
                 line, = ax.plot(
-                    x_vals,
-                    y_vals,
+                    s["pruning_percent"],
+                    s[y_col],
                     color=style["color"],
                     linestyle=style["linestyle"],
                     linewidth=2.0,
                     marker=style.get("marker", "o"),
                     markersize=5,
-                    label=scorer_labels[scorer],
+                    label=label,
                 )
 
                 if style.get("dashes") is not None:
@@ -655,7 +561,7 @@ def plot_extra_line(
             ax.set_ylabel(y_label)
             ax.set_title(f"{pipeline} – {title_suffix} ({qrels_val}, {metric_name})")
 
-            xticks = [0.0] + sorted(sub["pruning_percent"].dropna().unique().tolist())
+            xticks = sorted(sub["pruning_percent"].dropna().unique().tolist())
             ax.set_xticks(xticks)
             ax.set_xticklabels([
                 f"{int(x)}%" if x == int(x) else f"{x:g}%"
@@ -705,7 +611,15 @@ def plot_extra_heatmap(
         for pipeline in pipelines:
             sub = qsub[qsub["pipeline"] == pipeline].copy()
 
+            # La baseline serve solo per calcolare delta e retained: non deve
+            # comparire come riga nelle heatmap.
+            sub = sub[sub["scorer"] != BASELINE_SCORER].copy()
+
             if sub.empty:
+                print(
+                    f"[WARNING] Nessun modello diverso da {BASELINE_LABEL} "
+                    f"per la heatmap {pipeline} / {qrels_val}. Salto..."
+                )
                 continue
 
             sub["scorer_label"] = sub["scorer"].map(
@@ -722,7 +636,8 @@ def plot_extra_heatmap(
             ordered_labels = [
                 scorer_labels[s]
                 for s in scorer_order
-                if scorer_labels.get(s, s) in pivot.index
+                if s != BASELINE_SCORER
+                and scorer_labels.get(s, s) in pivot.index
             ]
 
             pivot = pivot.reindex(ordered_labels)
@@ -772,7 +687,12 @@ def plot_extra_heatmap(
                         )
 
             cbar = fig.colorbar(im, ax=ax)
-            cbar.set_label(value_col)
+            if value_col == "delta_value":
+                cbar.set_label(f"Δ metric vs {BASELINE_LABEL}")
+            elif value_col == "retained":
+                cbar.set_label(f"Retained effectiveness vs {BASELINE_LABEL}")
+            else:
+                cbar.set_label(value_col)
 
             fig.tight_layout()
 
@@ -807,10 +727,10 @@ def plot_maximum_safe_pruning(
 
         if delta_threshold is not None:
             good = g[g["delta_value"] >= delta_threshold]
-            criterion = f"Δ >= {delta_threshold}"
+            criterion = f"Δ vs {BASELINE_LABEL} >= {delta_threshold}"
         else:
             good = g[g["retained"] >= retained_threshold]
-            criterion = f"retained >= {retained_threshold}"
+            criterion = f"retained vs {BASELINE_LABEL} >= {retained_threshold}"
 
         safe_pruning = good["pruning_percent"].max() if not good.empty else 0.0
 
@@ -863,29 +783,39 @@ def plot_maximum_safe_pruning(
 
 
 def compute_aupc(metric_df, scorer_labels):
+    """Area media sotto la curva della retained effectiveness vs QualT5-Finetuned."""
     rows = []
 
     for (qrels_val, pipeline, scorer), g in metric_df.groupby(
         ["qrels_variant", "pipeline", "scorer"]
     ):
-        g = g.sort_values("pruning_percent").copy()
+        g = g.sort_values("pruning_percent").dropna(subset=["retained"]).copy()
 
-        x = np.array([0.0] + (g["pruning_percent"] / 100.0).tolist())
-        y = np.array([1.0] + g["retained"].tolist())
+        x = (g["pruning_percent"] / 100.0).to_numpy(dtype=float)
+        y = g["retained"].to_numpy(dtype=float)
 
-        if len(x) < 2 or np.max(x) == np.min(x):
-            aupc = np.nanmean(y)
+        if len(x) == 0:
+            aupc = np.nan
+            mean_retained = np.nan
+            min_retained = np.nan
+        elif len(x) < 2 or np.max(x) == np.min(x):
+            aupc = float(np.nanmean(y))
+            mean_retained = float(np.nanmean(y))
+            min_retained = float(np.nanmin(y))
         else:
-            aupc = np.trapz(y, x) / (np.max(x) - np.min(x))
+            aupc = float(np.trapz(y, x) / (np.max(x) - np.min(x)))
+            mean_retained = float(np.nanmean(y))
+            min_retained = float(np.nanmin(y))
 
         rows.append({
             "qrels_variant": qrels_val,
             "pipeline": pipeline,
             "scorer": scorer,
             "scorer_label": scorer_labels.get(scorer, scorer),
+            "baseline": BASELINE_LABEL,
             "aupc_retained": aupc,
-            "mean_retained": np.nanmean(y),
-            "min_retained": np.nanmin(y),
+            "mean_retained": mean_retained,
+            "min_retained": min_retained,
         })
 
     return pd.DataFrame(rows)
@@ -914,7 +844,7 @@ def plot_aupc(metric_df, scorer_labels, plot_dir):
         ax.axvline(1.0, color="black", linestyle="--", linewidth=1.5)
 
         ax.set_xlabel("AUPC retained effectiveness")
-        ax.set_title(f"Area under pruning curve ({qrels_val})")
+        ax.set_title(f"Area under pruning curve vs {BASELINE_LABEL} ({qrels_val})")
         ax.grid(True, axis="x", alpha=0.3)
 
         for i, v in enumerate(sub["aupc_retained"]):
@@ -957,8 +887,17 @@ def plot_rank_heatmap(metric_df, scorer_order, scorer_labels, plot_dir):
         for pipeline in pipelines:
             sub = qsub[qsub["pipeline"] == pipeline].copy()
 
+            # Escludi QualT5-Finetuned dalla visualizzazione: rimane la
+            # baseline usata per i confronti, ma non occupa una riga.
+            sub = sub[sub["scorer"] != BASELINE_SCORER].copy()
+
             if sub.empty:
                 continue
+
+            # Ricalcola il rank solo tra i modelli visualizzati.
+            sub["rank"] = sub.groupby("pruning_percent")["value"].rank(
+                ascending=False, method="min"
+            )
 
             pivot = sub.pivot_table(
                 index="scorer_label",
@@ -970,7 +909,8 @@ def plot_rank_heatmap(metric_df, scorer_order, scorer_labels, plot_dir):
             ordered_labels = [
                 scorer_labels[s]
                 for s in scorer_order
-                if scorer_labels.get(s, s) in pivot.index
+                if s != BASELINE_SCORER
+                and scorer_labels.get(s, s) in pivot.index
             ]
 
             pivot = pivot.reindex(ordered_labels)
@@ -1087,6 +1027,9 @@ def plot_pareto(metric_df, scorer_order, scorer_labels, scorer_styles, plot_dir)
                     continue
 
                 style = scorer_styles[scorer]
+                label = scorer_labels[scorer]
+                if scorer == BASELINE_SCORER:
+                    label = f"{label} (baseline)"
 
                 line, = ax.plot(
                     s["pruning_percent"],
@@ -1096,7 +1039,7 @@ def plot_pareto(metric_df, scorer_order, scorer_labels, scorer_styles, plot_dir)
                     linewidth=1.8,
                     marker=style.get("marker", "o"),
                     markersize=5,
-                    label=scorer_labels[scorer],
+                    label=label,
                     alpha=0.9,
                 )
 
@@ -1127,16 +1070,10 @@ def plot_pareto(metric_df, scorer_order, scorer_labels, scorer_styles, plot_dir)
                     fontsize=8,
                 )
 
-            full_val = float(sub["mean_full"].dropna().iloc[0])
-            ax.axhline(
-                full_val,
-                color="black",
-                linestyle="--",
-                linewidth=1.5,
-                label="Full",
+            ax.set_title(
+                f"{pipeline} – Pareto plot ({qrels_val}, {metric_name})\n"
+                f"Reference model: {BASELINE_LABEL}"
             )
-
-            ax.set_title(f"{pipeline} – Pareto plot ({qrels_val}, {metric_name})")
             ax.set_xlabel("Pruning percentage")
             ax.set_ylabel(metric_name)
             ax.grid(True, alpha=0.25)
@@ -1169,9 +1106,7 @@ def plot_extra_comparisons(
     retained_threshold=0.99,
     delta_threshold=None,
 ):
-    """
-    Crea grafici extra usando lo stesso plot_df dello script principale.
-    """
+    """Crea tutti i confronti usando QualT5-Finetuned come unica baseline."""
     metric_df = make_selected_metric_df(
         plot_df,
         force_rr10=force_rr10,
@@ -1179,12 +1114,12 @@ def plot_extra_comparisons(
 
     out_ready = os.path.join(
         plot_dir,
-        "extra_plot_ready_selected_metric_with_delta.csv",
+        "extra_plot_ready_selected_metric_vs_qualt5_finetuned.csv",
     )
     metric_df.to_csv(out_ready, index=False)
     print(f"[INFO] Salvato dataset extra plot-ready: {out_ready}")
 
-    print("[INFO] Creo extra plot: Δ metrica vs Full...")
+    print(f"[INFO] Creo extra plot: Δ metrica vs {BASELINE_LABEL}...")
     plot_extra_line(
         metric_df=metric_df,
         scorer_order=scorer_order,
@@ -1192,13 +1127,13 @@ def plot_extra_comparisons(
         scorer_styles=scorer_styles,
         plot_dir=plot_dir,
         y_col="delta_value",
-        y_label="Δ metric vs Full",
+        y_label=f"Δ metric vs {BASELINE_LABEL}",
         baseline_value=0.0,
-        title_suffix="Δ metric vs Full",
-        file_prefix="extra_delta",
+        title_suffix=f"Δ metric vs {BASELINE_LABEL}",
+        file_prefix="extra_delta_vs_qualt5_finetuned",
     )
 
-    print("[INFO] Creo extra plot: retained effectiveness...")
+    print(f"[INFO] Creo extra plot: retained effectiveness vs {BASELINE_LABEL}...")
     plot_extra_line(
         metric_df=metric_df,
         scorer_order=scorer_order,
@@ -1206,39 +1141,39 @@ def plot_extra_comparisons(
         scorer_styles=scorer_styles,
         plot_dir=plot_dir,
         y_col="retained",
-        y_label="Retained effectiveness",
+        y_label=f"Retained effectiveness vs {BASELINE_LABEL}",
         baseline_value=1.0,
-        title_suffix="Retained effectiveness",
-        file_prefix="extra_retained",
+        title_suffix=f"Retained effectiveness vs {BASELINE_LABEL}",
+        file_prefix="extra_retained_vs_qualt5_finetuned",
     )
 
-    print("[INFO] Creo extra heatmap: Δ metric...")
+    print(f"[INFO] Creo extra heatmap: Δ metrica vs {BASELINE_LABEL}...")
     plot_extra_heatmap(
         metric_df=metric_df,
         scorer_order=scorer_order,
         scorer_labels=scorer_labels,
         plot_dir=plot_dir,
         value_col="delta_value",
-        title_suffix="Δ metric vs Full",
-        file_prefix="extra_heatmap_delta",
+        title_suffix=f"Δ metric vs {BASELINE_LABEL}",
+        file_prefix="extra_heatmap_delta_vs_qualt5_finetuned",
         center_zero=True,
         fmt="{:.4f}",
     )
 
-    print("[INFO] Creo extra heatmap: retained effectiveness...")
+    print(f"[INFO] Creo extra heatmap: retained effectiveness vs {BASELINE_LABEL}...")
     plot_extra_heatmap(
         metric_df=metric_df,
         scorer_order=scorer_order,
         scorer_labels=scorer_labels,
         plot_dir=plot_dir,
         value_col="retained",
-        title_suffix="Retained effectiveness",
-        file_prefix="extra_heatmap_retained",
+        title_suffix=f"Retained effectiveness vs {BASELINE_LABEL}",
+        file_prefix="extra_heatmap_retained_vs_qualt5_finetuned",
         center_zero=False,
         fmt="{:.3f}",
     )
 
-    print("[INFO] Creo extra plot: maximum safe pruning...")
+    print(f"[INFO] Creo extra plot: maximum safe pruning vs {BASELINE_LABEL}...")
     plot_maximum_safe_pruning(
         metric_df=metric_df,
         scorer_labels=scorer_labels,
@@ -1247,7 +1182,7 @@ def plot_extra_comparisons(
         delta_threshold=delta_threshold,
     )
 
-    print("[INFO] Creo extra plot: AUPC retained...")
+    print(f"[INFO] Creo extra plot: AUPC retained vs {BASELINE_LABEL}...")
     plot_aupc(
         metric_df=metric_df,
         scorer_labels=scorer_labels,
@@ -1296,14 +1231,14 @@ def main():
     plot_dir = args.plot_dir if args.plot_dir is not None else args.res_dir
     os.makedirs(plot_dir, exist_ok=True)
 
-    active_scorers = get_active_scorers(
+    selected_scorers = get_active_scorers(
         include=include_scorers,
         exclude=exclude_scorers,
         group=args.group,
         only_enabled=True,
     )
 
-    if not active_scorers:
+    if not selected_scorers:
         raise ValueError(
             "Nessuno scorer attivo/selezionato.\n"
             f"include={include_scorers}\n"
@@ -1311,64 +1246,101 @@ def main():
             f"group={args.group}"
         )
 
-    print("\n[INFO] Scorer attivi/selezionati dal config:")
-    for scorer in active_scorers:
+    if BASELINE_SCORER not in SCORERS:
+        raise ValueError(
+            f"La baseline richiesta '{BASELINE_SCORER}' non è presente in SCORERS."
+        )
+
+    # La baseline viene sempre caricata, anche se --include o --group selezionano
+    # soltanto modelli metadata. Serve per effettuare il confronto corretto.
+    load_scorers = list(dict.fromkeys([BASELINE_SCORER] + selected_scorers))
+
+    print("\n[INFO] Scorer richiesti:")
+    for scorer in selected_scorers:
         print(f"  - {scorer} -> {get_label(scorer)}")
 
-    print(f"\n[INFO] Directory risultati compare_all: {args.base_dir}")
-    print(f"[INFO] Directory TOST: {args.res_dir}")
+    print(f"\n[INFO] Baseline obbligatoria: {BASELINE_SCORER} -> {get_label(BASELINE_SCORER)}")
+    print(f"[INFO] Directory risultati compare_all: {args.base_dir}")
     print(f"[INFO] Directory output grafici: {plot_dir}")
 
     summary_files = sorted(glob.glob(os.path.join(args.base_dir, "compare_all_*.csv")))
-
     summary_files = [
         f for f in summary_files
         if "_perquery_" not in os.path.basename(f)
         and "_timings" not in os.path.basename(f)
     ]
 
-    perf_df = load_performance_dataframe(summary_files, active_scorers)
+    baseline_file_pattern = os.path.join(
+        args.base_dir,
+        "compare_all_finetuned_qualt5_*.csv",
+    )
+    baseline_files = sorted(glob.glob(baseline_file_pattern))
+
+    if not baseline_files:
+        raise FileNotFoundError(
+            "Baseline QualT5-Finetuned non trovata.\n"
+            f"Pattern cercato: {baseline_file_pattern}\n"
+            "Il nome atteso è "
+            "compare_all_finetuned_qualt5_<qrels>_<threshold>.csv."
+        )
+
+    print(
+        f"[INFO] File baseline compare_all_finetuned_qualt5 trovati: "
+        f"{len(baseline_files)}"
+    )
+    for baseline_file in baseline_files:
+        print(f"  - {os.path.basename(baseline_file)}")
+
+    perf_df = load_performance_dataframe(summary_files, load_scorers)
 
     if perf_df.empty:
         raise ValueError(
             "Nessun risultato trovato per gli scorer selezionati.\n"
-            f"Scorer selezionati: {active_scorers}\n"
+            f"Scorer caricati: {load_scorers}\n"
             f"Directory risultati: {args.base_dir}\n"
             "Controlla i nomi dei file compare_all_*.csv e gli alias in scorer_config.py."
         )
 
-    tost_path = os.path.join(
-        args.res_dir,
-        "tost_pruning_noninferiority_5pct_full_vs_pruned.csv",
+    baseline_perf = perf_df[perf_df["scorer"] == BASELINE_SCORER].copy()
+    if baseline_perf.empty:
+        raise ValueError(
+            f"Mancano i risultati della baseline {BASELINE_LABEL}.\n"
+            "Devono essere presenti file con formato "
+            "compare_all_finetuned_qualt5_<qrels>_<threshold>.csv "
+            "nella directory indicata da --base-dir."
+        )
+
+    print(
+        f"[INFO] Righe baseline {BASELINE_LABEL} caricate: "
+        f"{len(baseline_perf)}"
     )
-    tost_keep = load_tost_dataframe(tost_path, active_scorers)
+    print(
+        "[INFO] Livelli di pruning baseline disponibili: "
+        + ", ".join(
+            f"{x:g}%" for x in sorted(
+                baseline_perf["pruning_percent"].dropna().unique().tolist()
+            )
+        )
+    )
 
-    plot_df = make_long_plot_dataframe(perf_df, tost_keep)
-
+    plot_df = make_long_plot_dataframe(perf_df)
     available_scorers = plot_df["scorer"].dropna().unique().tolist()
 
     scorer_order = [
         scorer
-        for scorer in active_scorers
+        for scorer in load_scorers
         if scorer in available_scorers
     ]
 
     if not scorer_order:
         raise ValueError(
             "Nessuno scorer selezionato ha dati disponibili nei CSV.\n"
-            f"Scorer attivi da config/CLI: {active_scorers}\n"
+            f"Scorer richiesti: {load_scorers}\n"
             f"Scorer disponibili nei risultati: {available_scorers}"
         )
 
-    scorer_labels = {
-        scorer: get_label(scorer)
-        for scorer in scorer_order
-    }
-
-    scorer_styles = {
-        scorer: get_scorer_style(scorer)
-        for scorer in scorer_order
-    }
+    scorer_labels = {scorer: get_label(scorer) for scorer in scorer_order}
+    scorer_styles = {scorer: get_scorer_style(scorer) for scorer in scorer_order}
 
     plot_ready_out = os.path.join(
         plot_dir,
@@ -1378,7 +1350,8 @@ def main():
 
     print("\n[INFO] Scorer che verranno effettivamente plottati:")
     for scorer in scorer_order:
-        print(f"  - {scorer} -> {scorer_labels[scorer]}")
+        suffix = " [BASELINE]" if scorer == BASELINE_SCORER else ""
+        print(f"  - {scorer} -> {scorer_labels[scorer]}{suffix}")
 
     force_rr10 = FORCE_RR10 or args.force_rr10
 
@@ -1403,6 +1376,7 @@ def main():
     )
 
     print("\n[DONE] Creati i grafici e i dataset plot-ready.")
+    print(f"[DONE] Baseline usata in tutti i confronti: {BASELINE_LABEL}")
     print(f"[DONE] Dataset principale: {plot_ready_out}")
     print(f"[DONE] Output grafici: {plot_dir}")
 
@@ -1416,6 +1390,6 @@ python -m metaqual.utils.statistical.plot_comparison \
   --base-dir results2 \
   --res-dir metaqual/utils/statistical/results_sts4 \
   --plot-dir metaqual/utils/statistical/results_sts4/plots_extra \
-  --include finetuned_qualt5,metadata_qualt5_concat_v2,metadata_qualt5_allmetapj,metadata_qualt5_attfus \
+  --include metadata_qualt5_concat_v2,metadata_qualt5_allmetapj,metadata_qualt5_attfus \
   --safe-delta -0.005
 """

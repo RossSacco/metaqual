@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 BASE1 = "results2"
-RES = "metaqual/utils/statistical/results_sts2"
+RES = "metaqual/utils/statistical/results_stsRR"
 
 if __name__ == "__main__":
     summary_files = sorted(glob.glob(os.path.join(BASE1, "compare_all_*.csv")))

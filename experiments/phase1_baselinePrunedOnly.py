@@ -283,6 +283,17 @@ def build_full_systems(config: Dict[str, Any]) -> Tuple[List[Any], List[str]]:
     active_retriever = config["experiment"].get("retriever", "all").lower()
     dataset_name = config["dataset"]["name"]
     indexes_dir = config["paths"]["indexes_dir"]
+    
+    top_k = int(config["experiment"].get("top_k", 100))
+    pisa_threads = int(
+        config["experiment"].get(
+            "pisa_threads",
+            max(1, min(16, os.cpu_count() or 1))
+        )
+    )
+
+    print(f"[DEBUG] Top-k retrieval: {top_k}")
+    print(f"[DEBUG] Thread PISA: {pisa_threads}")
 
     systems = []
     names = []
@@ -295,7 +306,7 @@ def build_full_systems(config: Dict[str, Any]) -> Tuple[List[Any], List[str]]:
             "terrier_stemmed",
             wmodel="BM25",
             verbose=True
-        )
+        ) % top_k
         systems.append(pipe_bm25_full)
         names.append("BM25 Full")
 
@@ -309,10 +320,16 @@ def build_full_systems(config: Dict[str, Any]) -> Tuple[List[Any], List[str]]:
         full_splade_index_path = os.path.join(indexes_dir, "splade_full")
         ensure_path_exists(full_splade_index_path, "Indice SPLADE full")
 
-        pipe_splade_full = (
-            encoder_gpu
-            >> pyterrier_pisa.PisaIndex(full_splade_index_path, stemmer="none").quantized()
-        ) % 100
+        splade_full_retriever = pyterrier_pisa.PisaIndex(
+            full_splade_index_path,
+            stemmer="none"
+        ).quantized(
+            num_results=top_k,
+            threads=pisa_threads,
+            verbose=True,
+        )
+
+        pipe_splade_full = encoder_gpu >> splade_full_retriever
 
         systems.append(pipe_splade_full)
         names.append("SPLADE Full")
@@ -329,7 +346,7 @@ def build_full_systems(config: Dict[str, Any]) -> Tuple[List[Any], List[str]]:
         )
 
         tasb_encoder_gpu = tasb_model.query_encoder(batch_size=64, verbose=True)
-        pipe_tasb_full = tasb_encoder_gpu >> full_tasb_index
+        pipe_tasb_full = (tasb_encoder_gpu >> full_tasb_index ) % top_k
 
         systems.append(pipe_tasb_full)
         names.append("TAS-B Full")
@@ -351,6 +368,17 @@ def build_pruned_systems(
     threshold = config["experiment"]["threshold"]
     active_retriever = config["experiment"].get("retriever", "all").lower()
     indexes_dir = config["paths"]["indexes_dir"]
+    
+    top_k = int(config["experiment"].get("top_k", 100))
+    pisa_threads = int(
+        config["experiment"].get(
+            "pisa_threads",
+            max(1, min(16, os.cpu_count() or 1))
+        )
+    )
+
+    print(f"[DEBUG] Top-k retrieval: {top_k}")
+    print(f"[DEBUG] Thread PISA: {pisa_threads}")
 
     index_scorer_name = get_index_scorer_name(config, scorer_name)
 
@@ -396,10 +424,16 @@ def build_pruned_systems(
         splade_pruned_path = os.path.join(pruned_root, "pisa_splade")
         ensure_path_exists(splade_pruned_path, "Indice SPLADE pruned")
 
-        pipe_splade_p = (
-            encoder_gpu
-            >> pyterrier_pisa.PisaIndex(splade_pruned_path, stemmer="none").quantized()
-        ) % 100
+        splade_pruned_retriever = pyterrier_pisa.PisaIndex(
+            splade_pruned_path,
+            stemmer="none"
+        ).quantized(
+            num_results=top_k,
+            threads=pisa_threads,
+            verbose=True,
+        )
+
+        pipe_splade_p = encoder_gpu >> splade_pruned_retriever
 
         systems.append(pipe_splade_p)
         names.append("SPLADE Pruned")
@@ -413,10 +447,10 @@ def build_pruned_systems(
         tasb_pruned_path = os.path.join(pruned_root, "tasb.flex")
         ensure_path_exists(tasb_pruned_path, "Indice TAS-B pruned")
 
-        pipe_tasb_p = RetrievalPipelines(
+        pipe_tasb_p = (RetrievalPipelines(
             tasb_pruned_path,
             query_encoder=tasb_model
-        ).get_tasb()
+        ).get_tasb()) % top_k
 
         systems.append(pipe_tasb_p)
         names.append("TAS-B Pruned")
@@ -872,4 +906,4 @@ if __name__ == "__main__":
     main()
     
     
-#CUDA_VISIBLE_DEVICES=0 nohup python -m metaqual.experiments.phase1_baselinePrunedOnly --config metaqual/meta_config.yaml > scoring2.log 2>&1 &
+#CUDA_VISIBLE_DEVICES=0 nohup python -m metaqual.experiments.phase1_baselinePrunedOnly --config metaqual/meta_config.yaml > scoring.log 2>&1 &
