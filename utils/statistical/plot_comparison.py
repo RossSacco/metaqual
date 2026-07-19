@@ -21,7 +21,7 @@ from metaqual.utils.plot.scorer_config import (
 
 
 BASE1 = "results2"
-RES = "metaqual/utils/statistical/results_stsRR"
+RES = "metaqual/utils/statistical/results_stsRRv1"
 
 # Se vuoi plottare sempre RR@10, lascia True.
 # Se invece vuoi mantenere la logica:

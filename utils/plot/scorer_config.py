@@ -16,9 +16,57 @@ SCORERS = {
         "marker": "o",
         "higher_is_better": True,
     },
+    
+    "metadata_qualt5_concat_2s": {
+        "enabled": True,
+        "group": "metadata_qualt5",
+        "cache_patterns": [
+            "metadata_qualt5_{dataset_name}_CONCAT_2S.cache",
+        ],
+        "compare_aliases": [
+            "metadata_qualt5_CONCAT_2S",
+        ],
+        "label": "Metadata-QualT5-CONCAT-2Step",
+        "color": "#90FF99",
+        "linestyle": "--",
+        "marker": "s",
+        "higher_is_better": True,
+    },
+    
+    "metadata_qualt5_allmetapj_2s": {
+        "enabled": True,
+        "group": "metadata_qualt5",
+        "cache_patterns": [
+            "metadata_qualt5_{dataset_name}_ALLMETAPJ_2S.cache",
+        ],
+        "compare_aliases": [
+            "metadata_qualt5_ALLMETAPJ_2S",
+        ],
+        "label": "Metadata-QualT5-ALLMETAPJ-2Step",
+        "color": "#E48DFF",
+        "linestyle": "--",
+        "marker": "s",
+        "higher_is_better": True,
+    },
+    
+    "metadata_qualt5_attfus_2s": {
+        "enabled": True,
+        "group": "metadata_qualt5",
+        "cache_patterns": [
+            "metadata_qualt5_{dataset_name}_ATTFUS_2S.cache",
+        ],
+        "compare_aliases": [
+            "metadata_qualt5_ATTFUS_2S",
+        ],
+        "label": "Metadata-QualT5-ATTFUS-2Step",
+        "color": "#FFF282",
+        "linestyle": "--",
+        "marker": "s",
+        "higher_is_better": True,
+    },
 
     "metadata_qualt5_concat_v2": {
-        "enabled": True,
+        "enabled": False,
         "group": "metadata_qualt5",
         "cache_patterns": [
             "metadata_qualt5_{dataset_name}_CONCAT-V2-FA-ck1.cache",
@@ -35,7 +83,7 @@ SCORERS = {
     },
 
     "metadata_qualt5_allmetapj": {
-        "enabled": True,
+        "enabled": False,
         "group": "metadata_qualt5",
         "cache_patterns": [
             "metadata_qualt5_{dataset_name}_ALLMETAPJ_ck1.cache",
@@ -51,7 +99,7 @@ SCORERS = {
     },
 
     "metadata_qualt5_attfus": {
-        "enabled": True,
+        "enabled": False,
         "group": "metadata_qualt5",
         "cache_patterns": [
             "metadata_qualt5_{dataset_name}_ATTFUS_ck5.cache",
