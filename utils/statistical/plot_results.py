@@ -20,7 +20,7 @@ from metaqual.utils.plot.scorer_config import (
 
 
 BASE1 = "results2"
-RES = "metaqual/utils/statistical/results_stsRRv1"
+RES = "metaqual/utils/statistical/2s-vs-or--ALLMETAPJ"
 
 # False:
 #   - dev.small -> RR@10

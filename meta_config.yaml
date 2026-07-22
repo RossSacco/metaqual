@@ -1,16 +1,16 @@
 
-#dataset:
-  #name: "msmarco_passage"
-  #topics_variant:
-  #  - "test-2019"
-  #  - "test-2020"
-  #qrels_variant:
-  #  - "test-2019"
-  #  - "test-2020"
 dataset:
   name: "msmarco_passage"
-  topics_variant: "dev.small"
-  qrels_variant: "dev.small"
+  topics_variant:
+    - "test-2019"
+    - "test-2020"
+  qrels_variant:
+    - "test-2019"
+    - "test-2020"
+#dataset:
+  #name: "msmarco_passage"
+  #topics_variant: "dev.small"
+  #qrels_variant: "dev.small"
 
 experiment:
   # Nome logico dello scorer, cioè quello usato dal tuo codice in get_scorer/base_scorer.
@@ -26,7 +26,7 @@ experiment:
   # /data/data-sacco/cache/metadata_qualt5_msmarco_passage_ATTFUS_2S.cache
   cache_file: "metadata_qualt5_msmarco_passage_ATTFUS_2S.cache"
 
-  threshold: 0.60
+  threshold: 0.15
   restart_cache: false
   retriever: "all"
 
@@ -38,7 +38,7 @@ paths:
   indexes_dir: "/data/data-sacco/indexes"
   results_dir: "./results2"
   runs_dir: "/data/data-sacco/runs"
-  full_runs_dir: "/data/data-sacco/runs/runs_full_msmarco_all"
+  full_runs_dir: "/data/data-sacco/runs/runs_full_msmarco_all_trec"
 
 scorers:
   finetuned_qualt5:

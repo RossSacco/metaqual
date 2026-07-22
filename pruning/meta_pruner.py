@@ -298,4 +298,8 @@ if __name__ == "__main__":
 
     run_full_pruning_and_indexing(config)
     
-##CUDA_VISIBLE_DEVICES=0 nohup python -m metaqual.pruning.meta_pruner --config metaqual/config.yaml > indexing_meta_45.log 2>&1 &
+##CUDA_VISIBLE_DEVICES=0 nohup python -m metaqual.pruning.meta_pruner --config metaqual/meta_config.yaml > indexing_1.log 2>&1 &
+
+#sulla 0 : 0.60
+#sulla 1 : 
+

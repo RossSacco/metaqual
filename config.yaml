@@ -1,36 +1,44 @@
+
+#dataset:
+  #name: "msmarco_passage"
+  #topics_variant:
+  #  - "test-2019"
+  #  - "test-2020"
+  #qrels_variant:
+  #  - "test-2019"
+  #  - "test-2020"
 dataset:
   name: "msmarco_passage"
-  topics_variant:
-    - "test-2019"
-    - "test-2020"
-  qrels_variant:
-    - "test-2019"
-    - "test-2020"
+  topics_variant: "dev.small"
+  qrels_variant: "dev.small"
 
 experiment:
   # Nome logico dello scorer, cioè quello usato dal tuo codice in get_scorer/base_scorer.
   scorer: "metadata_qualt5"
-  index_scorer_name: "metadata_qualt5_ALLMETAPJ_ck1"
+  index_scorer_name: "metadata_qualt5_ALLMETAPJ_2S"
   # Nome specifico dell'esperimento/cache.
   # Verrà usato per nominare la cartella degli indici.
-  scorer_output_name: "metadata_qualt5_ALLMETAPJ_ck1"
+  scorer_output_name: "metadata_qualt5_ALLMETAPJ_2S"
 
   
   # Cache effettiva da usare.
   # Lo script cercherà:
-  # /data/data-sacco/cache/metadata_qualt5_msmarco_passage_CONCAT.cache
-  cache_file: "metadata_qualt5_msmarco_passage_ALLMETAPJ_ck1.cache"
+  # /data/data-sacco/cache/metadata_qualt5_msmarco_passage_CONCAT_2S.cache
+  cache_file: "metadata_qualt5_msmarco_passage_ALLMETAPJ_2S.cache"
 
   threshold: 0.60
   restart_cache: false
   retriever: "all"
+
+  top_k: 100
+  pisa_threads: 16
 
 paths:
   cache_dir: "/data/data-sacco/cache"
   indexes_dir: "/data/data-sacco/indexes"
   results_dir: "./results2"
   runs_dir: "/data/data-sacco/runs"
-  full_runs_dir: "/data/data-sacco/runs/runs_full_msmarco_all_trec"
+  full_runs_dir: "/data/data-sacco/runs/runs_full_msmarco_all"
 
 scorers:
   finetuned_qualt5:
@@ -40,15 +48,15 @@ scorers:
     device: "cuda"
 
   metadata_qualt5:
-    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/scorer-checkpoint-1000"
+    model_name_or_path: "/home/sacco/metaqual/outputs/metadata-qualt5-2step-allmeta-featureaware-noffn/stage2_joint_finetuning/best-scorer"
     base_model_name_or_path: "/home/sacco/metaqual/outputs/qt5-supervised-t5-base/checkpoint-10000"
     
     metadata_path: "/home/sacco/data/msmarco_passage/msmarco_passage_lexical_metadata.parquet"
   
-    lexical_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/lexical_metadata_scaler.pkl"
-    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/metadata_metadata_scaler.pkl"
-    embedding_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/embedding_metadata_scaler.pkl"
-    token_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-allmeta_token_projection-featureaware-noffnpostatt-fullDec-lr5e5-12k-V2/token_metadata_scaler.pkl"
+    lexical_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-2step-allmeta-featureaware-noffn/lexical_metadata_scaler.pkl"
+    metadata_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-2step-allmeta-featureaware-noffn/metadata_metadata_scaler.pkl"
+    embedding_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-2step-allmeta-featureaware-noffn/embedding_metadata_scaler.pkl"
+    token_scaler_path: "/home/sacco/metaqual/outputs/metadata-qualt5-2step-allmeta-featureaware-noffn/token_metadata_scaler.pkl"
     batch_size: 100
     max_length: 512
     device: "cuda"
@@ -65,7 +73,7 @@ scorers:
     metadata_projection_type: "linear"
     metadata_normalization_mode: "feature_aware"
     decoder_trainable_scope: "full_decoder"
-    unfreeze_lm_head: true
+    unfreeze_lm_head: False
     unfreeze_shared_embeddings: false
 
 

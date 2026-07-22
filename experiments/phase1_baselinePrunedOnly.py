@@ -1,4 +1,5 @@
 import os
+from pydoc_data import topics
 import sys
 import re
 import time
@@ -833,6 +834,109 @@ def run_single_scorer_evaluation(
         res_perq = res_perq.sort_values(
             by=["name", "qid", "measure"]
         ).reset_index(drop=True)
+    
+    # =========================================================
+    # CONTROLLO COPERTURA QUERY
+    # =========================================================
+
+    check_df = res_perq.copy()
+
+    # Uniforma il tipo dei qid per evitare confronti errati
+    check_df["qid"] = check_df["qid"].astype(str)
+
+    expected_qids = set(topics["qid"].astype(str))
+    expected_num_queries = len(expected_qids)
+    print("\n" + "=" * 90)
+    print("[CHECK QUERY COVERAGE]")
+    print(f"[CHECK] Threshold corrente: {torch.threshold}")
+    print(f"[CHECK] Query attese dai topics: {expected_num_queries}")
+    print("=" * 90)
+
+    coverage_rows = []
+    for measure in sorted(check_df["measure"].astype(str).unique()):
+        print(f"\n[CHECK] Metrica: {measure}")
+
+        measure_df = check_df[
+            check_df["measure"].astype(str) == measure
+        ]
+
+        for system_name, group in measure_df.groupby("name"):
+            present_qids = set(group["qid"])
+
+            missing_qids = expected_qids - present_qids
+            extra_qids = present_qids - expected_qids
+
+            duplicated_mask = group.duplicated(
+                subset=["qid", "measure"],
+                keep=False
+            )
+
+            duplicated_qids = set(
+                group.loc[duplicated_mask, "qid"]
+            )
+
+            missing_percentage = (
+                100.0 * len(missing_qids) / expected_num_queries
+                if expected_num_queries > 0
+                else 0.0
+            )
+
+            print(
+                f"  {system_name}: "
+                f"query_presenti={len(present_qids)}, "
+                f"mancanti={len(missing_qids)}, "
+                f"mancanti_pct={missing_percentage:.2f}%, "
+                f"extra={len(extra_qids)}, "
+                f"duplicati={len(duplicated_qids)}"
+            )
+
+            if missing_qids:
+                print(
+                    "    Esempi query mancanti:",
+                    sorted(missing_qids)[:20]
+                )
+
+            if extra_qids:
+                print(
+                    "    Esempi query extra:",
+                    sorted(extra_qids)[:20]
+                )
+            if duplicated_qids:
+                print(
+                    "    Esempi query duplicate:",
+                    sorted(duplicated_qids)[:20]
+                )
+            coverage_rows.append(
+                {
+                    "threshold": threshold,
+                    "measure": measure,
+                    "name": system_name,
+                    "expected_queries": expected_num_queries,
+                    "present_queries": len(present_qids),
+                    "missing_queries": len(missing_qids),
+                    "missing_percentage": missing_percentage,
+                    "extra_queries": len(extra_qids),
+                    "duplicated_queries": len(duplicated_qids),
+                }
+            )
+
+    coverage_df = pd.DataFrame(coverage_rows)
+
+    coverage_path = os.path.join(
+        results_dir,
+        (
+            f"query_coverage_"
+            f"{active_retriever}_"
+            f"{index_scorer_name}_"
+            f"{qrels_name}_"
+            f"{threshold}.csv"
+        )
+    )
+
+    coverage_df.to_csv(coverage_path, index=False)
+
+    print(f"\n[CHECK] Report salvato in: {coverage_path}")
+    print("=" * 90 + "\n")
 
     if "name" in timings_df.columns:
         timings_df = timings_df.sort_values(by=["name"]).reset_index(drop=True)
@@ -906,4 +1010,4 @@ if __name__ == "__main__":
     main()
     
     
-#CUDA_VISIBLE_DEVICES=0 nohup python -m metaqual.experiments.phase1_baselinePrunedOnly --config metaqual/meta_config.yaml > scoring.log 2>&1 &
+#CUDA_VISIBLE_DEVICES=0 nohup python -m metaqual.experiments.phase1_baselinePrunedOnly --config metaqual/meta_config.yaml > scoring_2.log 2>&1 &

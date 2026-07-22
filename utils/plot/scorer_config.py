@@ -18,7 +18,7 @@ SCORERS = {
     },
     
     "metadata_qualt5_concat_2s": {
-        "enabled": True,
+        "enabled": False,
         "group": "metadata_qualt5",
         "cache_patterns": [
             "metadata_qualt5_{dataset_name}_CONCAT_2S.cache",
@@ -50,7 +50,7 @@ SCORERS = {
     },
     
     "metadata_qualt5_attfus_2s": {
-        "enabled": True,
+        "enabled": False,
         "group": "metadata_qualt5",
         "cache_patterns": [
             "metadata_qualt5_{dataset_name}_ATTFUS_2S.cache",
@@ -83,7 +83,7 @@ SCORERS = {
     },
 
     "metadata_qualt5_allmetapj": {
-        "enabled": False,
+        "enabled": True,
         "group": "metadata_qualt5",
         "cache_patterns": [
             "metadata_qualt5_{dataset_name}_ALLMETAPJ_ck1.cache",
